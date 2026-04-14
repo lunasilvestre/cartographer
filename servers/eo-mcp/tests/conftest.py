@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from fastmcp import FastMCP
 
 from eo_mcp.config import Settings
-from eo_mcp.tools import raster
+from eo_mcp.tools import raster, vector, workflows
 
 
 @pytest.fixture
@@ -14,6 +14,7 @@ def settings_fx() -> Settings:
     return Settings(
         raster_url="https://fake.example/raster",
         stac_url="https://fake.example",
+        vector_url="https://fake.example/vector",
         auth_token="",
     )
 
@@ -25,12 +26,24 @@ def mcp_fx(settings_fx: Settings) -> FastMCP:
     return mcp
 
 
+@pytest.fixture
+def mcp_full_fx(settings_fx: Settings) -> FastMCP:
+    """Full MCP with raster + vector + workflow tools registered."""
+    mcp = FastMCP("test-eo-mcp-full")
+    raster.register(mcp, settings_fx)
+    vector.register(mcp, settings_fx)
+    workflows.register(mcp, settings_fx)
+    return mcp
+
+
 @pytest.fixture(autouse=True)
 def reset_raster_client():
-    """Reset the lazy client before and after each test."""
+    """Reset the lazy clients before and after each test."""
     raster._client = None
+    vector._client = None
     yield
     raster._client = None
+    vector._client = None
 
 
 @pytest.fixture

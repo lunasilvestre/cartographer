@@ -13,7 +13,9 @@ Spatial intelligence harness for cloud-native Earth Observation.
 
 ### eo-mcp (this repo)
 - **Raster tools:** get_raster_info, get_tile_url, get_zonal_statistics
-- **Backend:** TiTiler at $EO_MCP_RASTER_URL (default: https://api.cheias.pt/raster)
+- **Vector tools:** list_vector_collections, get_vector_features, get_vector_feature, get_vector_tile_url, get_collection_queryables
+- **Workflow tools:** flood_rainfall_analysis, multi_layer_summary, collection_health_check
+- **Backends:** TiTiler at $EO_MCP_RASTER_URL, tipg at $EO_MCP_VECTOR_URL (defaults under https://api.cheias.pt)
 - **Run:** `cd servers/eo-mcp && python -m eo_mcp.server`
 
 ### Sidekick servers (external, install separately)
