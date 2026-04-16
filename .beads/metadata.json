@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "cartographer",
+  "project_id": "8f83210d-c906-4228-b489-ea3a8985f487"
+}
