@@ -1,0 +1,42 @@
+version: 2
+
+# Security updates are enabled at the repository level and do not need a config
+# entry. This file adds *version* updates, and — more usefully — groups them.
+# Without grouping, a week of routine transitive bumps arrives as one PR per
+# package: seven were open at once before the lockfile was regenerated, none of
+# which carried a change the regeneration did not already include.
+
+updates:
+  # The lockfile lives in the package directory, not the repo root.
+  - package-ecosystem: uv
+    directory: /servers/eo-mcp
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # One PR per week for everything routine. A grouped update either passes
+      # CI as a set or fails as a set, which is the same way `uv lock --upgrade`
+      # is run by hand.
+      python-dependencies:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      # fastmcp majors are a deliberate decision, not a routine bump: 2.x cannot
+      # import this code at all, and pyproject pins >=3.0,<4 for that reason.
+      # A major bump needs a human to read the changelog first.
+      - dependency-name: fastmcp
+        update-types: [version-update:semver-major]
+
+  # CI pins every action to an exact version so a floating tag cannot change the
+  # build underneath us. That safety only holds if something watches for updates.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      github-actions:
+        patterns: ["*"]
