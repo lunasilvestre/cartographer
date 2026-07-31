@@ -34,13 +34,16 @@ Spatial intelligence and storytelling harness. Focused on cloud-native EO analys
 | gdal-mcp (JordanGunn) | Transform (local) | CPU-bound (rasterio/GDAL) | atlas only |
 | duckdb-mcp | Query (analytical) | In-process DB | atlas only |
 
-## Skill Stack
+## Skill Stack — planned, none built yet
 
 | Skill | Purpose | Status |
 |-------|---------|--------|
-| geo-viz | Teaches Claude to render eo-mcp tile URLs as MapLibre/deck.gl artifacts | Build after eo-mcp v0.1 |
-| geo-auto | Data engineering workflow patterns (COG conversion, STAC publishing) | Future |
-| geo-ml | Inference integration (Clay embeddings, classification) | Future |
+| geo-viz | Teaches Claude to render eo-mcp tile URLs as MapLibre/deck.gl artifacts | Not started |
+| geo-auto | Data engineering workflow patterns (COG conversion, STAC publishing) | Not started |
+| geo-ml | Inference integration (Clay embeddings, classification) | Not started |
+
+Nothing in this table exists on disk. The `skills/` directory is absent by design —
+it will be created when the first skill is written, not before.
 
 ## Prompt Tagging Convention
 
@@ -50,7 +53,7 @@ title: Flood Extent Mapping
 domain: disaster-response
 servers_required: [eo-mcp]
 servers_optional: [stac-mcp]
-skills_required: [geo-viz]
+skills_required: []  # no skills exist yet; omit or leave empty
 complexity: basic    # basic (1-3 tools) | intermediate (4-6) | advanced (7+)
 tool_calls: 3
 demo_endpoint: api.cheias.pt/raster
@@ -59,31 +62,31 @@ demo_endpoint: api.cheias.pt/raster
 
 ## Repo Structure
 
+Actual layout as of 2026-07-31. Items marked `# planned` do not exist yet.
+
 ```
 cartographer/
 ├── README.md
 ├── CLAUDE.md
 ├── ARCHITECTURE.md
+├── LICENSE                      # Apache-2.0
+├── .env.example
+├── .github/workflows/ci.yml
 ├── servers/
 │   └── eo-mcp/
 │       ├── pyproject.toml
+│       ├── README.md
+│       ├── Dockerfile
 │       ├── src/eo_mcp/
 │       │   ├── server.py
-│       │   ├── tools/raster.py
-│       │   ├── tools/vector.py
-│       │   ├── tools/workflows.py
-│       │   └── config.py
-│       ├── tests/
-│       └── Dockerfile
-├── skills/
-│   ├── geo-viz/SKILL.md
-│   ├── geo-auto/SKILL.md        # future
-│   └── geo-ml/SKILL.md          # future
+│       │   ├── config.py
+│       │   └── tools/{raster,vector,workflows}.py
+│       ├── tests/               # 60 unit + 11 integration
+│       └── docs/                # live-probed TiTiler + tipg API notes
 ├── prompts/
-│   ├── disaster/flood-extent.md
-│   ├── environment/ndvi-anomaly.md
-│   └── curation/collection-health.md
-└── docs/
+│   └── disaster/flood-extent.md
+├── skills/                      # planned
+└── docs/                        # planned
     ├── PREREQUISITES.md
     ├── SETUP-ATLAS.md
     ├── SETUP-SLIPLANE.md

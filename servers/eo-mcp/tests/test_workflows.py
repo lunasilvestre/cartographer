@@ -394,9 +394,13 @@ async def test_collection_health_check_happy(mcp_full_fx: FastMCP, mock_httpx_re
 
     def _router(method, path, **kw):
         # STAC collections endpoint
-        if "/collections" in path and "vector" not in str(kw.get("base_url", "")):
-            if "statistics" not in path and "/items" not in path:
-                return _resp(200, _STAC_COLLECTIONS)
+        if (
+            "/collections" in path
+            and "vector" not in str(kw.get("base_url", ""))
+            and "statistics" not in path
+            and "/items" not in path
+        ):
+            return _resp(200, _STAC_COLLECTIONS)
         # Vector collections endpoint
         if "collections" in path and "/items" not in path and "statistics" not in path:
             return _resp(200, _VECTOR_COLLECTIONS)

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock
+
 import httpx
 import pytest
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
-from unittest.mock import AsyncMock, MagicMock
 
 
 def _resp(status: int, body: dict | None = None, text: str = "") -> MagicMock:

@@ -5,8 +5,9 @@ Each tool gets: happy path, error path, and at least one edge case.
 """
 from __future__ import annotations
 
-from fastmcp import FastMCP
 from unittest.mock import AsyncMock, MagicMock
+
+from fastmcp import FastMCP
 
 
 def _resp(status: int, body: dict | list | None = None, text: str = "") -> MagicMock:

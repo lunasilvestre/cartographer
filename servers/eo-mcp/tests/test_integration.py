@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 
 import pytest
-
 from fastmcp import FastMCP
 
 from eo_mcp.config import Settings
