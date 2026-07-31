@@ -1,63 +1,82 @@
+"""Vector tools: thin proxies onto tipg's OGC Features API.
+
+Failures raise ``fastmcp.exceptions.ToolError``; see :mod:`eo_mcp.http` for the
+full error contract.
+"""
+
 from __future__ import annotations
 
 import asyncio
 
-import httpx
+from fastmcp.exceptions import ToolError
 
-_client: httpx.AsyncClient | None = None
+from ..http import Backends, list_all_collections, require
 
-
-async def _get_client(settings) -> httpx.AsyncClient:
-    global _client
-    if _client is None:
-        headers = {}
-        if settings.auth_token:
-            headers["Authorization"] = f"Bearer {settings.auth_token}"
-        _client = httpx.AsyncClient(
-            base_url=settings.vector_url,
-            timeout=settings.request_timeout,
-            headers=headers,
-        )
-    return _client
+#: tipg exposes PostGIS's own function-backed tables alongside real data. They
+#: are named by PostGIS convention, not by this deployment, so matching on the
+#: convention generalises to any PostGIS instance. They are hidden by default
+#: because an agent shown ``st_hexagongrid`` will eventually try to query it.
+_INTERNAL_TABLE_PREFIXES = ("st_", "postgis_", "spatial_ref_sys", "geometry_columns")
 
 
-async def _request(
-    client: httpx.AsyncClient,
-    method: str,
-    path: str,
-    *,
-    params=None,
-    json=None,
-) -> dict:
-    r = await client.request(method, path, params=params, json=json)
-    if r.status_code >= 400:
-        return {"error": r.text, "status": r.status_code, "url": str(r.url)}
-    return r.json()
-
-
-def _normalize_collection_id(collection_id: str) -> str:
+def normalize_collection_id(collection_id: str) -> str:
     """Prepend 'public.' schema prefix if no dot present in collection_id."""
     if "." not in collection_id:
         return f"public.{collection_id}"
     return collection_id
 
 
-def register(mcp, settings) -> None:
+def is_internal(collection_id: str) -> bool:
+    table = collection_id.split(".", 1)[-1].lower()
+    return table.startswith(_INTERNAL_TABLE_PREFIXES)
+
+
+def slim_feature(feature: dict) -> dict:
+    """Drop tipg's self-referential `id` and `links` from a returned feature.
+
+    tipg sets each feature's `id` to the WKB hex of its own geometry and embeds
+    that same hex in a `links` URL. Measured against
+    `public.flood_extent_emsr864` on 2026-07-31, those two fields are 95% of a
+    real flood feature — 5.96 MB for a feature whose geometry is 1.82 MB.
+
+    They are also unusable: `docs/tipg-api-notes.md` records that `items/{id}`
+    does not round-trip against PostGIS tables, which is precisely why
+    `get_vector_feature` filters on `ogc_fid` instead. Returning 4 MB of dead
+    weight into a model's context is a cost with no matching benefit. `ogc_fid`
+    stays in `properties`, and that is the id every tool here accepts.
+    """
+    if not isinstance(feature, dict):
+        return feature
+    return {k: v for k, v in feature.items() if k not in ("id", "links")}
+
+
+def register(mcp, backends: Backends) -> None:
+    vector = backends.vector
+
     @mcp.tool()
-    async def list_vector_collections() -> dict:
+    async def list_vector_collections(include_internal: bool = False) -> dict:
         """List available vector data collections from the OGC Features API.
 
         Returns collection IDs, titles, descriptions, spatial extents, and
         temporal ranges. Use this to discover what vector data is available
         before querying features.
+
+        PostGIS ships function-backed utility tables (st_hexagongrid,
+        postgis_srs, and friends) in the same schema as real data. They are
+        excluded by default and counted under `excluded_internal`; pass
+        include_internal=True to see them.
         """
-        client = await _get_client(settings)
-        result = await _request(client, "GET", "/collections", params={"f": "json"})
-        if "error" in result:
-            return result
+        # Paginated: tipg returns all 13 in one page today, but a deployment
+        # with more would be silently truncated at the default page size.
+        collections = await list_all_collections(vector, {"f": "json"})
 
         simplified = []
-        for col in result.get("collections", []):
+        excluded = []
+        for col in collections:
+            col_id = col.get("id") or ""
+            if not include_internal and is_internal(col_id):
+                excluded.append(col_id)
+                continue
             extent = col.get("extent", {})
             spatial = extent.get("spatial", {})
             temporal = extent.get("temporal", {})
@@ -70,7 +89,7 @@ def register(mcp, settings) -> None:
                     "extent_temporal": temporal.get("interval"),
                 }
             )
-        return {"collections": simplified}
+        return {"collections": simplified, "excluded_internal": excluded}
 
     @mcp.tool()
     async def get_vector_features(
@@ -92,14 +111,29 @@ def register(mcp, settings) -> None:
         Returns GeoJSON FeatureCollection. Use bbox for spatial filtering (4 floats:
         west,south,east,north). Use datetime for temporal filtering (ISO 8601 instant
         or interval like '2026-02-01/2026-02-10'). Use filter with CQL2 expressions
-        for attribute filtering (e.g. "event_date='2026-02-08'" or "area_ha > 100").
+        for attribute filtering (e.g. "datetime='2026-02-08'" or "area_ha > 100").
         Use simplify (decimal degrees) to reduce geometry complexity for large polygons.
+        WARNING: past a certain tolerance tipg returns null geometry rather than a
+        coarser one, with HTTP 200 and properties intact, so the loss is silent.
+        Measured on public.flood_extent_emsr864 (2026-07-31): 0.0001 nulls nothing,
+        0.0005 nulls 29%, 0.001 nulls 61%, 0.01 nulls 96%. Prefer 0.0001 — roughly
+        11 m, already a 6x size cut. This tool counts nulled geometries for you and
+        reports them in `null_geometry_count`; check it before using the result.
         Use properties to select specific columns (reduces payload).
-        Use sortby for ordering (prefix with - for descending, e.g. '-event_date').
+        Use sortby for ordering (prefix with - for descending, e.g. '-datetime').
         Limit defaults to 10; max depends on server config (typically 10000).
         """
-        collection_id = _normalize_collection_id(collection_id)
-        client = await _get_client(settings)
+        if limit < 1:
+            raise ToolError(f"eo-mcp: limit must be at least 1, got {limit}.")
+        if offset < 0:
+            raise ToolError(f"eo-mcp: offset cannot be negative, got {offset}.")
+        if bbox is not None and len(bbox) != 4:
+            raise ToolError(
+                f"eo-mcp: bbox needs exactly 4 numbers (west, south, east, "
+                f"north), got {len(bbox)}."
+            )
+
+        collection_id = normalize_collection_id(collection_id)
         path = f"/collections/{collection_id}/items"
 
         params: list[tuple[str, str | int | float]] = [
@@ -124,7 +158,51 @@ def register(mcp, settings) -> None:
         if geom_column is not None:
             params.append(("geom-column", geom_column))
 
-        return await _request(client, "GET", path, params=params)
+        url = vector.url_for(path, params)
+        result = await vector.request("GET", path, params=params)
+        # A payload without `features` is not an empty result, it is a broken
+        # response; saying so beats returning something that reads as "no data".
+        require(result, "features", source="tipg", url=url)
+
+        features = [slim_feature(f) for f in (result.get("features") or [])]
+        matched = result.get("numberMatched")
+        out = {**result, "features": features}
+
+        warnings: dict[str, object] = {}
+
+        # Past some tolerance tipg drops the geometry entirely rather than
+        # coarsening it, and still answers 200 with the properties intact. A
+        # feature with no geometry is not a smaller feature, it is a missing
+        # one, and nothing else in the payload says so.
+        nulled = sum(1 for f in features if f.get("geometry") is None)
+        if nulled:
+            warnings["null_geometry_count"] = nulled
+            warnings["null_geometry_note"] = (
+                f"{nulled} of {len(features)} features came back with null "
+                f"geometry"
+                + (
+                    f" — simplify={simplify} is too coarse for this collection. "
+                    f"Try 0.0001, which loses none."
+                    if simplify is not None
+                    else " from the backend."
+                )
+                + " Those features cannot be used as an area of interest and are "
+                "not part of any spatial result derived from this response."
+            )
+
+        # A page of results presented as the whole answer is the same bug class
+        # as an error dict presented as data. Say so, at the top of the payload.
+        if isinstance(matched, int) and matched > len(features):
+            warnings["truncated"] = True
+            warnings["note"] = (
+                f"Showing {len(features)} of {matched} matching features "
+                f"(limit={limit}, offset={offset}). This is a page, not the "
+                f"whole result — do not describe it as the complete set. "
+                f"Raise limit, page with offset, or narrow with bbox/filter."
+            )
+        else:
+            warnings["truncated"] = False
+        return {**warnings, **out}
 
     @mcp.tool()
     async def get_vector_feature(
@@ -134,27 +212,41 @@ def register(mcp, settings) -> None:
         """Get a single vector feature by ogc_fid from a PostGIS collection.
 
         Returns a GeoJSON Feature with all properties and full geometry.
-        feature_id is the integer primary key (ogc_fid). The tipg /items/{id}
-        endpoint is not usable against PostGIS tables (the tile-layer id is a
-        WKB hex string that does not round-trip), so this tool queries via
-        ogc_fid CQL2 filter and returns the first feature.
+        feature_id is the integer primary key (ogc_fid); it must be an integer.
+        The tipg /items/{id} endpoint is not usable against PostGIS tables (the
+        tile-layer id is a WKB hex string that does not round-trip), so this
+        tool queries via an ogc_fid CQL2 filter.
         """
-        collection_id = _normalize_collection_id(collection_id)
-        client = await _get_client(settings)
+        # feature_id is interpolated into a CQL2 expression, so it must be
+        # proven to be an integer first. Without this, "1 OR 1=1" matches every
+        # row in the table and the tool returns whichever one sorts first — a
+        # different feature than the caller asked for, reported as a success.
+        try:
+            ogc_fid = int(str(feature_id).strip())
+        except (TypeError, ValueError):
+            raise ToolError(
+                f"eo-mcp: feature_id must be an integer ogc_fid, got "
+                f"{feature_id!r}. Read ogc_fid from a feature's properties in "
+                f"get_vector_features."
+            ) from None
+
+        collection_id = normalize_collection_id(collection_id)
         path = f"/collections/{collection_id}/items"
         params = [
             ("f", "geojson"),
-            ("filter", f"ogc_fid={feature_id}"),
+            ("filter", f"ogc_fid={ogc_fid}"),
             ("filter-lang", "cql2-text"),
             ("limit", 1),
         ]
-        result = await _request(client, "GET", path, params=params)
-        if "error" in result:
-            return result
-        features = result.get("features", [])
+        url = vector.url_for(path, params)
+        result = await vector.request("GET", path, params=params)
+        features = require(result, "features", source="tipg", url=url)
         if not features:
-            return {"error": f"feature {feature_id} not found", "status": 404}
-        return features[0]
+            raise ToolError(
+                f"eo-mcp: no feature with ogc_fid={ogc_fid} exists in "
+                f"{collection_id}. The query succeeded and matched nothing."
+            )
+        return slim_feature(features[0])
 
     @mcp.tool()
     async def get_vector_tile_url(
@@ -164,30 +256,45 @@ def register(mcp, settings) -> None:
 
         Returns a TileJSON document with tile URL template, bounds, min/max zoom,
         and a default MapLibre style. The tiles use MVT (Mapbox Vector Tiles) format
-        with source layer named 'default'.
+        with source layer named 'default'. The style is best-effort: if tipg cannot
+        produce one, `style` is null and the tile URLs are still returned.
         """
-        collection_id = _normalize_collection_id(collection_id)
-        client = await _get_client(settings)
+        collection_id = normalize_collection_id(collection_id)
         tilejson_path = f"/collections/{collection_id}/tiles/WebMercatorQuad/tilejson.json"
         style_path = f"/collections/{collection_id}/tiles/WebMercatorQuad/style.json"
 
         tilejson_result, style_result = await asyncio.gather(
-            _request(client, "GET", tilejson_path),
-            _request(client, "GET", style_path),
+            vector.request("GET", tilejson_path),
+            vector.request("GET", style_path),
+            return_exceptions=True,
         )
 
-        if "error" in tilejson_result:
-            return tilejson_result
+        if isinstance(tilejson_result, BaseException):
+            raise tilejson_result
+        # A missing or broken style is not a reason to withhold the tile URLs;
+        # anything that is not a backend error is a real bug and still escapes.
+        if isinstance(style_result, ToolError):
+            style = None
+        elif isinstance(style_result, BaseException):
+            raise style_result
+        else:
+            style = style_result
 
-        style = None if "error" in style_result else style_result
+        url = vector.url_for(tilejson_path)
+        tiles = require(tilejson_result, "tiles", source="tipg tilejson", url=url)
+        if not isinstance(tiles, list) or not tiles:
+            raise ToolError(
+                f"eo-mcp: tipg tilejson response from {url} has an empty "
+                f"'tiles' list, so there is no tile URL to return."
+            )
 
         return {
             "tilejson": tilejson_result,
             "style": style,
-            "tile_url_template": tilejson_result["tiles"][0],
-            "bounds": tilejson_result["bounds"],
-            "minzoom": tilejson_result["minzoom"],
-            "maxzoom": tilejson_result["maxzoom"],
+            "tile_url_template": tiles[0],
+            "bounds": require(tilejson_result, "bounds", source="tipg tilejson", url=url),
+            "minzoom": require(tilejson_result, "minzoom", source="tipg tilejson", url=url),
+            "maxzoom": require(tilejson_result, "maxzoom", source="tipg tilejson", url=url),
         }
 
     @mcp.tool()
@@ -200,7 +307,8 @@ def register(mcp, settings) -> None:
         what CQL2 filters are available before calling get_vector_features with
         a filter expression.
         """
-        collection_id = _normalize_collection_id(collection_id)
-        client = await _get_client(settings)
+        collection_id = normalize_collection_id(collection_id)
         path = f"/collections/{collection_id}/queryables"
-        return await _request(client, "GET", path, params={"f": "schemajson"})
+        # tipg only emits the JSON-schema form under ?f=schemajson; the default
+        # negotiation returns HTML.
+        return await vector.request("GET", path, params={"f": "schemajson"})

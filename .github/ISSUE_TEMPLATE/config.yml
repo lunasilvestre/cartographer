@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/lunasilvestre/cartographer/security/advisories/new
+    about: Please report vulnerabilities privately, not as a public issue. See SECURITY.md.
+  - name: Backend availability
+    url: https://github.com/lunasilvestre/cartographer/blob/main/docs/SELF-HOSTING.md
+    about: api.cheias.pt is a personal deployment with no uptime commitment. If it is down or slow, that is expected rather than a bug — point the server at your own stack.
+  - name: Known API quirks
+    url: https://github.com/lunasilvestre/cartographer/blob/main/servers/eo-mcp/docs/tipg-api-notes.md
+    about: Places where the live tipg and TiTiler APIs diverge from their documentation, probed and recorded. Worth checking before filing.

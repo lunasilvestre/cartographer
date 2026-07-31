@@ -1,22 +1,30 @@
 """Unit tests for the workflow tools (v0.4).
 
-Each workflow tool chains raster + vector HTTP calls. We differentiate
-which backend is being called via URL path inspection in a side_effect router.
+Each workflow tool chains raster + vector + STAC calls. These tests patch
+``httpx.AsyncClient.send`` rather than ``.request`` so the router can tell the
+three backends apart by absolute URL — ``/collections`` exists on both STAC and
+tipg, so the relative path is not enough.
+
+The workflow tools have a deliberately different error contract from the other
+eight: a per-item failure is reported in band alongside the items that
+succeeded, with an explicit ``partial_failures`` count, and only a total failure
+raises. These tests pin both halves of that.
 """
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
+import httpx
+import pytest
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 
+from .conftest import make_response
 
-def _resp(status: int, body: dict | list | None = None, text: str = "") -> MagicMock:
-    r = MagicMock()
-    r.status_code = status
-    r.json.return_value = body if body is not None else {}
-    r.text = text
-    r.url = f"https://fake.example/test?status={status}"
-    return r
+# Base URLs from settings_fx. The STAC backend is the bare host, so it is
+# identified by *not* being one of the other two.
+RASTER_PREFIX = "https://fake.example/raster"
+VECTOR_PREFIX = "https://fake.example/vector"
 
 
 # ---------------------------------------------------------------------------
@@ -34,7 +42,7 @@ _FLOOD_FEATURE_A = {
     "type": "Feature",
     "id": "feat-001",
     "geometry": _FLOOD_POLYGON,
-    "properties": {"event_date": "2026-02-08", "area_ha": 150.0},
+    "properties": {"datetime": "2026-02-08T00:00:00+00:00", "area_ha": 150.0},
 }
 
 _FLOOD_FEATURE_B = {
@@ -46,7 +54,7 @@ _FLOOD_FEATURE_B = {
             [[-7.8, 39.1], [-7.3, 39.1], [-7.3, 39.6], [-7.8, 39.6], [-7.8, 39.1]]
         ],
     },
-    "properties": {"event_date": "2026-02-08", "area_ha": 80.0},
+    "properties": {"datetime": "2026-02-08T00:00:00+00:00", "area_ha": 80.0},
 }
 
 _FEATURES_BODY = {
@@ -75,8 +83,9 @@ _STATS_FEATURE = {
 _STAC_COLLECTIONS = {
     "collections": [
         {"id": "precipitation-daily", "title": "Daily Precipitation"},
-        {"id": "soil-moisture-anomaly", "title": "Soil Moisture Anomaly"},
-    ]
+        {"id": "soil-moisture-daily", "title": "Daily Soil Moisture"},
+    ],
+    "links": [{"rel": "self", "href": "https://fake.example/collections"}],
 }
 
 _VECTOR_COLLECTIONS = {
@@ -88,8 +97,11 @@ _VECTOR_COLLECTIONS = {
                 "spatial": {"bbox": [[-9.0, 38.0, -6.0, 41.0]]},
                 "temporal": {"interval": [["2026-02-01T00:00:00Z", None]]},
             },
-        }
-    ]
+        },
+        # PostGIS utility table: must not be probed as if it were data.
+        {"id": "public.st_hexagongrid", "title": "public.st_hexagongrid"},
+    ],
+    "links": [{"rel": "self", "href": "https://fake.example/vector/collections"}],
 }
 
 _COLLECTION_META = {
@@ -101,13 +113,47 @@ _COLLECTION_META = {
     },
 }
 
-_RASTER_INFO = {
-    "data": {
-        "bounds": [-9.6, 36.9, -6.1, 42.2],
-        "dtype": "float32",
-        "count": 1,
-    }
-}
+_STAC_ITEMS = {"features": [{"id": "precipitation-storm-total"}], "numberMatched": 1}
+
+
+# ---------------------------------------------------------------------------
+# Routing helpers
+# ---------------------------------------------------------------------------
+
+
+def backend_of(request: httpx.Request) -> str:
+    url = str(request.url)
+    if url.startswith(RASTER_PREFIX):
+        return "raster"
+    if url.startswith(VECTOR_PREFIX):
+        return "vector"
+    return "stac"
+
+
+def flood_router(
+    *,
+    features=_FEATURES_BODY,
+    stats_statuses: list[int] | None = None,
+    vector_status: int = 200,
+):
+    """Route the vector feature query and the per-feature statistics POSTs.
+
+    ``stats_statuses`` supplies a status per statistics call, in order, so a
+    test can make exactly one of them fail.
+    """
+    remaining = list(stats_statuses or [])
+
+    def _router(request: httpx.Request, **kw):
+        if backend_of(request) == "vector":
+            if vector_status >= 400:
+                return make_response(request, vector_status, text="tipg unavailable")
+            return make_response(request, 200, features)
+        status = remaining.pop(0) if remaining else 200
+        if status >= 400:
+            return make_response(request, status, text="raster out of extent")
+        return make_response(request, 200, _STATS_FEATURE)
+
+    return _router
 
 
 # ---------------------------------------------------------------------------
@@ -115,19 +161,9 @@ _RASTER_INFO = {
 # ---------------------------------------------------------------------------
 
 
-async def test_flood_rainfall_analysis_happy(mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock):
+async def test_flood_rainfall_analysis_happy(mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock):
     """Happy path: vector features fetched, rainfall stats computed per feature."""
-
-    def _router(method, path, **kw):
-        if "/items" in path and "statistics" not in path:
-            # vector features call
-            return _resp(200, _FEATURES_BODY)
-        elif "statistics" in path:
-            # raster zonal stats call
-            return _resp(200, _STATS_FEATURE)
-        return _resp(200, {})
-
-    mock_httpx_request.side_effect = _router
+    mock_httpx_send.side_effect = flood_router()
 
     result = await mcp_full_fx.call_tool(
         "flood_rainfall_analysis",
@@ -139,35 +175,16 @@ async def test_flood_rainfall_analysis_happy(mcp_full_fx: FastMCP, mock_httpx_re
     )
 
     sc = result.structured_content
-    assert "features" in sc or "type" in sc
-    # Must have enriched features (either directly or wrapped)
-    features = sc.get("features") or sc.get("feature_collection", {}).get("features", [])
-    if not features and sc.get("type") == "FeatureCollection":
-        features = sc["features"]
-    # At least one feature should have rainfall stats
-    has_stats = any(
-        "rainfall_stats" in f.get("properties", {}) or "statistics" in f.get("properties", {})
-        for f in features
-    )
-    assert has_stats or len(features) >= 0  # tool ran without error
+    assert sc["type"] == "FeatureCollection"
+    assert len(sc["features"]) == 2
+    assert all("rainfall_stats" in f["properties"] for f in sc["features"])
+    assert sc["partial_failures"] == 0
+    assert sc["failed"] == []
 
 
-async def test_flood_rainfall_analysis_partial_failure(mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock):
-    """If one feature's stats fail, it gets rainfall_error; others get rainfall_stats."""
-    call_count = {"stats": 0}
-
-    def _router(method, path, **kw):
-        if "/items" in path and "statistics" not in path:
-            return _resp(200, _FEATURES_BODY)
-        elif "statistics" in path:
-            call_count["stats"] += 1
-            if call_count["stats"] == 1:
-                # First stats call fails
-                return _resp(500, text="raster out of extent")
-            return _resp(200, _STATS_FEATURE)
-        return _resp(200, {})
-
-    mock_httpx_request.side_effect = _router
+async def test_flood_rainfall_analysis_partial_failure(mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock):
+    """One feature failing is reported in band and counted, not swallowed."""
+    mock_httpx_send.side_effect = flood_router(stats_statuses=[500, 200])
 
     result = await mcp_full_fx.call_tool(
         "flood_rainfall_analysis",
@@ -180,35 +197,34 @@ async def test_flood_rainfall_analysis_partial_failure(mcp_full_fx: FastMCP, moc
     )
 
     sc = result.structured_content
-    # Should not be a hard error at the top level
-    assert "error" not in sc or sc.get("features") is not None or sc.get("type") is not None
+    props = [f["properties"] for f in sc["features"]]
+    assert sum("rainfall_error" in p for p in props) == 1
+    assert sum("rainfall_stats" in p for p in props) == 1
+    assert sc["partial_failures"] == 1
+    assert len(sc["failed"]) == 1
 
-    # Find features in the result
-    features = []
-    if sc.get("type") == "FeatureCollection":
-        features = sc.get("features", [])
-    elif "features" in sc:
-        features = sc["features"]
 
-    if len(features) >= 2:
-        props_list = [f.get("properties", {}) for f in features]
-        has_error = any("rainfall_error" in p for p in props_list)
-        has_success = any(
-            "rainfall_stats" in p or "statistics" in p for p in props_list
+async def test_flood_rainfall_analysis_all_features_fail_raises(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
+):
+    """A result where nothing could be computed is a failure, not an empty answer."""
+    mock_httpx_send.side_effect = flood_router(stats_statuses=[500, 500])
+
+    with pytest.raises(ToolError, match="failed for all 2 flood polygons"):
+        await mcp_full_fx.call_tool(
+            "flood_rainfall_analysis",
+            {
+                "flood_collection_id": "public.flood_extent_emsr864",
+                "precipitation_collection_id": "precipitation-daily",
+                "precipitation_item_id": "precipitation-storm-total",
+            },
         )
-        # With partial failure: one should error, one should succeed
-        assert has_error or has_success  # at minimum the tool handled partial failures
 
 
-async def test_flood_rainfall_analysis_empty_features(mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock):
-    """If vector returns no features, result should be an empty FeatureCollection."""
-
-    def _router(method, path, **kw):
-        if "/items" in path and "statistics" not in path:
-            return _resp(200, {"type": "FeatureCollection", "features": [], "numberMatched": 0, "numberReturned": 0})
-        return _resp(200, {})
-
-    mock_httpx_request.side_effect = _router
+async def test_flood_rainfall_analysis_empty_features(mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock):
+    """No flood polygons is a real, empty answer — and says so."""
+    empty = {"type": "FeatureCollection", "features": [], "numberMatched": 0}
+    mock_httpx_send.side_effect = flood_router(features=empty)
 
     result = await mcp_full_fx.call_tool(
         "flood_rainfall_analysis",
@@ -220,26 +236,24 @@ async def test_flood_rainfall_analysis_empty_features(mcp_full_fx: FastMCP, mock
     )
 
     sc = result.structured_content
-    # Should not crash; result should be empty or contain empty features
-    features = sc.get("features", [])
-    if sc.get("type") == "FeatureCollection":
-        features = sc.get("features", [])
-    assert features == [] or "error" not in sc
+    assert sc["features"] == []
+    assert sc["partial_failures"] == 0
+    assert "no flood polygons" in sc["note"]
 
 
-async def test_flood_rainfall_analysis_with_event_date(mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock):
-    """event_date parameter should be forwarded to filter the vector query."""
+async def test_flood_rainfall_analysis_with_event_date(mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock):
+    """event_date is converted into a whole-day datetime interval for tipg."""
+    seen: list[str] = []
 
-    def _router(method, path, **kw):
-        if "/items" in path and "statistics" not in path:
-            return _resp(200, {**_FEATURES_BODY, "features": [_FLOOD_FEATURE_A]})
-        elif "statistics" in path:
-            return _resp(200, _STATS_FEATURE)
-        return _resp(200, {})
+    def _router(request: httpx.Request, **kw):
+        if backend_of(request) == "vector":
+            seen.append(str(request.url))
+            return make_response(request, 200, {**_FEATURES_BODY, "features": [_FLOOD_FEATURE_A]})
+        return make_response(request, 200, _STATS_FEATURE)
 
-    mock_httpx_request.side_effect = _router
+    mock_httpx_send.side_effect = _router
 
-    result = await mcp_full_fx.call_tool(
+    await mcp_full_fx.call_tool(
         "flood_rainfall_analysis",
         {
             "flood_collection_id": "public.flood_extent_emsr864",
@@ -249,9 +263,96 @@ async def test_flood_rainfall_analysis_with_event_date(mcp_full_fx: FastMCP, moc
         },
     )
 
+    assert "2026-02-08T00%3A00%3A00Z%2F2026-02-08T23%3A59%3A59Z" in seen[0]
+
+
+async def test_flood_rainfall_analysis_vector_error_raises(mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock):
+    """If the driving query fails there is no analysis, so the tool raises."""
+    mock_httpx_send.side_effect = flood_router(vector_status=503)
+
+    with pytest.raises(ToolError, match="503"):
+        await mcp_full_fx.call_tool(
+            "flood_rainfall_analysis",
+            {
+                "flood_collection_id": "public.flood_extent_emsr864",
+                "precipitation_collection_id": "precipitation-daily",
+                "precipitation_item_id": "precipitation-storm-total",
+            },
+        )
+
+
+async def test_flood_rainfall_analysis_rejects_bad_limit(mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock):
+    with pytest.raises(ToolError, match="limit must be at least 1"):
+        await mcp_full_fx.call_tool("flood_rainfall_analysis", {"limit": 0})
+
+    assert not mock_httpx_send.called
+
+
+async def test_flood_rainfall_analysis_feature_no_geometry(mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock):
+    """A feature with geometry=None gets rainfall_error instead of crashing."""
+    feature_no_geom = {"type": "Feature", "id": "feat-null-geom", "geometry": None, "properties": {"area_ha": 10}}
+    good = {"type": "FeatureCollection", "features": [feature_no_geom, _FLOOD_FEATURE_A]}
+    mock_httpx_send.side_effect = flood_router(features=good)
+
+    result = await mcp_full_fx.call_tool(
+        "flood_rainfall_analysis",
+        {
+            "flood_collection_id": "public.flood_extent_emsr864",
+            "precipitation_collection_id": "precipitation-daily",
+            "precipitation_item_id": "precipitation-storm-total",
+        },
+    )
+
     sc = result.structured_content
-    # At minimum, the call should complete without a top-level error
-    assert "status" not in sc or sc.get("status") < 400
+    assert "rainfall_error" in sc["features"][0]["properties"]
+    assert sc["failed"] == ["feat-null-geom"]
+
+
+async def test_flood_rainfall_analysis_unsupported_geometry_type(mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock):
+    """A GeometryCollection gets rainfall_error rather than crashing the run."""
+    feature_geomcoll = {
+        "type": "Feature",
+        "id": "feat-geomcoll",
+        "geometry": {"type": "GeometryCollection", "geometries": []},
+        "properties": {"area_ha": 5},
+    }
+    body = {"type": "FeatureCollection", "features": [feature_geomcoll, _FLOOD_FEATURE_A]}
+    mock_httpx_send.side_effect = flood_router(features=body)
+
+    result = await mcp_full_fx.call_tool(
+        "flood_rainfall_analysis",
+        {
+            "flood_collection_id": "public.flood_extent_emsr864",
+            "precipitation_collection_id": "precipitation-daily",
+            "precipitation_item_id": "precipitation-storm-total",
+        },
+    )
+
+    props = result.structured_content["features"][0]["properties"]
+    assert "GeometryCollection" in props["rainfall_error"]
+
+
+async def test_flood_rainfall_analysis_feature_geometry_is_feature(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
+):
+    """A feature whose geometry field is itself a Feature is passed through."""
+    inner_feature = {"type": "Feature", "geometry": _FLOOD_POLYGON, "properties": {}}
+    body = {
+        "type": "FeatureCollection",
+        "features": [{"type": "Feature", "id": "f", "geometry": inner_feature, "properties": {}}],
+    }
+    mock_httpx_send.side_effect = flood_router(features=body)
+
+    result = await mcp_full_fx.call_tool(
+        "flood_rainfall_analysis",
+        {
+            "flood_collection_id": "public.flood_extent_emsr864",
+            "precipitation_collection_id": "precipitation-daily",
+            "precipitation_item_id": "precipitation-storm-total",
+        },
+    )
+
+    assert "rainfall_stats" in result.structured_content["features"][0]["properties"]
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +374,7 @@ _RASTER_LAYERS = [
         "label": "precipitation",
     },
     {
-        "collection_id": "soil-moisture-anomaly",
+        "collection_id": "soil-moisture-daily",
         "item_id": "sm-composite",
         "asset": "data",
         "label": "soil_moisture",
@@ -281,9 +382,21 @@ _RASTER_LAYERS = [
 ]
 
 
-async def test_multi_layer_summary_happy(mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock):
+def stats_router(statuses: list[int] | None = None):
+    remaining = list(statuses or [])
+
+    def _router(request: httpx.Request, **kw):
+        status = remaining.pop(0) if remaining else 200
+        if status >= 400:
+            return make_response(request, status, text="layer unavailable")
+        return make_response(request, 200, _STATS_FEATURE)
+
+    return _router
+
+
+async def test_multi_layer_summary_happy(mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock):
     """Each raster layer gets stats; result keyed by label."""
-    mock_httpx_request.return_value = _resp(200, _STATS_FEATURE)
+    mock_httpx_send.side_effect = stats_router()
 
     result = await mcp_full_fx.call_tool(
         "multi_layer_summary",
@@ -291,14 +404,15 @@ async def test_multi_layer_summary_happy(mcp_full_fx: FastMCP, mock_httpx_reques
     )
 
     sc = result.structured_content
-    assert "layers" in sc
-    assert "precipitation" in sc["layers"]
-    assert "soil_moisture" in sc["layers"]
+    assert set(sc["layers"]) == {"precipitation", "soil_moisture"}
+    assert all(entry["ok"] for entry in sc["layers"].values())
+    assert sc["partial_failures"] == 0
+    assert sc["aoi"] == _AOI_POLYGON
 
 
-async def test_multi_layer_summary_includes_aoi(mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock):
-    """Result should echo back the AOI geometry."""
-    mock_httpx_request.return_value = _resp(200, _STATS_FEATURE)
+async def test_multi_layer_summary_partial_failure(mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock):
+    """A failed layer is marked ok=false and counted, not omitted."""
+    mock_httpx_send.side_effect = stats_router([500, 200])
 
     result = await mcp_full_fx.call_tool(
         "multi_layer_summary",
@@ -306,49 +420,68 @@ async def test_multi_layer_summary_includes_aoi(mcp_full_fx: FastMCP, mock_httpx
     )
 
     sc = result.structured_content
-    assert "aoi" in sc
+    assert sc["partial_failures"] == 1
+    assert len(sc["failed"]) == 1
+    failed_entry = sc["layers"][sc["failed"][0]]
+    assert failed_entry["ok"] is False
+    assert "500" in failed_entry["error"]
 
 
-async def test_multi_layer_summary_invalid_geojson_point(mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock):
-    """Point geometry is unsupported; returns 400 without making HTTP calls."""
-    result = await mcp_full_fx.call_tool(
-        "multi_layer_summary",
-        {
-            "geojson": {"type": "Point", "coordinates": [-8.0, 39.0]},
-            "raster_layers": _RASTER_LAYERS,
-        },
-    )
+async def test_multi_layer_summary_all_layers_fail_raises(mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock):
+    mock_httpx_send.side_effect = stats_router([500, 503])
 
-    sc = result.structured_content
-    assert sc["status"] == 400
-    assert "error" in sc
-    # No HTTP calls should have been made
-    assert not mock_httpx_request.called
+    with pytest.raises(ToolError, match="failed for all 2 layer"):
+        await mcp_full_fx.call_tool(
+            "multi_layer_summary",
+            {"geojson": _AOI_POLYGON, "raster_layers": _RASTER_LAYERS},
+        )
 
 
-async def test_multi_layer_summary_invalid_geojson_linestring(mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock):
-    """LineString geometry is also unsupported."""
-    result = await mcp_full_fx.call_tool(
-        "multi_layer_summary",
-        {
-            "geojson": {
-                "type": "LineString",
-                "coordinates": [[-8.0, 39.0], [-7.5, 39.5]],
-            },
-            "raster_layers": _RASTER_LAYERS,
-        },
-    )
+async def test_multi_layer_summary_empty_layers_raises(mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock):
+    with pytest.raises(ToolError, match="raster_layers is empty"):
+        await mcp_full_fx.call_tool(
+            "multi_layer_summary", {"geojson": _AOI_POLYGON, "raster_layers": []}
+        )
 
-    sc = result.structured_content
-    assert sc["status"] == 400
-    assert "error" in sc
-    assert not mock_httpx_request.called
+    assert not mock_httpx_send.called
 
 
-async def test_multi_layer_summary_feature_containing_polygon(mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock):
+async def test_multi_layer_summary_layer_missing_item_id_raises(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
+):
+    with pytest.raises(ToolError, match=r"raster_layers\[0\] is missing required item_id"):
+        await mcp_full_fx.call_tool(
+            "multi_layer_summary",
+            {"geojson": _AOI_POLYGON, "raster_layers": [{"collection_id": "c"}]},
+        )
+
+    assert not mock_httpx_send.called
+
+
+@pytest.mark.parametrize(
+    "bad_geojson",
+    [
+        {"type": "Point", "coordinates": [-8.0, 39.0]},
+        {"type": "LineString", "coordinates": [[-8.0, 39.0], [-7.5, 39.5]]},
+        {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-8.0, 39.0]}, "properties": {}},
+    ],
+)
+async def test_multi_layer_summary_invalid_geojson(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock, bad_geojson: dict
+):
+    """Non-area AOIs are rejected before any HTTP call."""
+    with pytest.raises(ToolError, match="(?i)polygon"):
+        await mcp_full_fx.call_tool(
+            "multi_layer_summary",
+            {"geojson": bad_geojson, "raster_layers": _RASTER_LAYERS},
+        )
+
+    assert not mock_httpx_send.called
+
+
+async def test_multi_layer_summary_feature_containing_polygon(mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock):
     """Feature wrapping a Polygon should be accepted."""
-    mock_httpx_request.return_value = _resp(200, _STATS_FEATURE)
-
+    mock_httpx_send.side_effect = stats_router()
     feature_aoi = {"type": "Feature", "geometry": _AOI_POLYGON, "properties": {}}
 
     result = await mcp_full_fx.call_tool(
@@ -356,32 +489,26 @@ async def test_multi_layer_summary_feature_containing_polygon(mcp_full_fx: FastM
         {"geojson": feature_aoi, "raster_layers": _RASTER_LAYERS},
     )
 
-    sc = result.structured_content
-    # Should succeed
-    assert "error" not in sc or "layers" in sc
+    assert result.structured_content["partial_failures"] == 0
 
 
-async def test_multi_layer_summary_label_fallback(mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock):
-    """When no label is provided, key defaults to collection_id/item_id or similar."""
-    mock_httpx_request.return_value = _resp(200, _STATS_FEATURE)
-
-    layers_no_label = [
-        {
-            "collection_id": "precipitation-daily",
-            "item_id": "precipitation-storm-total",
-            "asset": "data",
-        }
-    ]
+async def test_multi_layer_summary_label_fallback(mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock):
+    """When no label is provided, the key falls back to collection_id/item_id."""
+    mock_httpx_send.side_effect = stats_router()
 
     result = await mcp_full_fx.call_tool(
         "multi_layer_summary",
-        {"geojson": _AOI_POLYGON, "raster_layers": layers_no_label},
+        {
+            "geojson": _AOI_POLYGON,
+            "raster_layers": [
+                {"collection_id": "precipitation-daily", "item_id": "precipitation-storm-total"}
+            ],
+        },
     )
 
-    sc = result.structured_content
-    assert "layers" in sc
-    # There must be at least one key in layers
-    assert len(sc["layers"]) == 1
+    assert list(result.structured_content["layers"]) == [
+        "precipitation-daily/precipitation-storm-total"
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -389,395 +516,454 @@ async def test_multi_layer_summary_label_fallback(mcp_full_fx: FastMCP, mock_htt
 # ---------------------------------------------------------------------------
 
 
-async def test_collection_health_check_happy(mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock):
-    """Both tipg and STAC /collections endpoints are hit; result reports status per collection."""
+def health_router(
+    *,
+    stac_pages: list[dict] | None = None,
+    vector_pages: list[dict] | None = None,
+    stac_list_status: int = 200,
+    vector_list_status: int = 200,
+    probe_status: int = 200,
+):
+    """Route the two collection listings and the per-collection probes."""
+    stac_pages = stac_pages if stac_pages is not None else [_STAC_COLLECTIONS]
+    vector_pages = vector_pages if vector_pages is not None else [_VECTOR_COLLECTIONS]
+    stac_seen = {"n": 0}
+    vector_seen = {"n": 0}
 
-    def _router(method, path, **kw):
-        # STAC collections endpoint
-        if (
-            "/collections" in path
-            and "vector" not in str(kw.get("base_url", ""))
-            and "statistics" not in path
-            and "/items" not in path
-        ):
-            return _resp(200, _STAC_COLLECTIONS)
-        # Vector collections endpoint
-        if "collections" in path and "/items" not in path and "statistics" not in path:
-            return _resp(200, _VECTOR_COLLECTIONS)
-        # Collection metadata probe
-        if "flood_extent_emsr864" in path:
-            return _resp(200, _COLLECTION_META)
-        # Raster info probe
-        if "/info" in path:
-            return _resp(200, _RASTER_INFO)
-        return _resp(200, {})
+    def _router(request: httpx.Request, **kw):
+        backend = backend_of(request)
+        path = request.url.path
+        is_listing = path.rstrip("/").endswith("/collections")
 
-    mock_httpx_request.side_effect = _router
+        if backend == "vector":
+            if is_listing:
+                if vector_list_status >= 400:
+                    return make_response(request, vector_list_status, text="tipg down")
+                page = vector_pages[min(vector_seen["n"], len(vector_pages) - 1)]
+                vector_seen["n"] += 1
+                return make_response(request, 200, page)
+            if probe_status >= 400:
+                return make_response(request, probe_status, text="collection not found")
+            return make_response(request, 200, _COLLECTION_META)
+
+        if backend == "stac":
+            if is_listing:
+                if stac_list_status >= 400:
+                    return make_response(request, stac_list_status, text="stac down")
+                page = stac_pages[min(stac_seen["n"], len(stac_pages) - 1)]
+                stac_seen["n"] += 1
+                return make_response(request, 200, page)
+            if probe_status >= 400:
+                return make_response(request, probe_status, text="items not found")
+            return make_response(request, 200, _STAC_ITEMS)
+
+        return make_response(request, 200, {})
+
+    return _router
+
+
+async def test_collection_health_check_happy(mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock):
+    mock_httpx_send.side_effect = health_router()
 
     result = await mcp_full_fx.call_tool("collection_health_check", {})
 
     sc = result.structured_content
-    assert "collections" in sc or "raster" in sc or "vector" in sc or "status" in sc
-    # Should not be a hard error
-    assert not (sc.get("status", 200) >= 400)
+    assert set(sc["raster"]) == {"precipitation-daily", "soil-moisture-daily"}
+    assert set(sc["vector"]) == {"public.flood_extent_emsr864"}
+    assert all(e["reachable"] for e in sc["raster"].values())
+    assert sc["partial_failures"] == 0
+    assert sc["unreachable"] == []
 
 
-async def test_collection_health_check_with_specific_ids(mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock):
-    """When collection_ids is provided, only those collections are checked."""
+async def test_collection_health_check_skips_postgis_utility_tables(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
+):
+    """st_hexagongrid is in the tipg listing but is not data to health-check."""
+    mock_httpx_send.side_effect = health_router()
 
-    def _router(method, path, **kw):
-        if "flood_extent_emsr864" in path and "/items" not in path and "statistics" not in path:
-            return _resp(200, _COLLECTION_META)
-        if "/info" in path:
-            return _resp(200, _RASTER_INFO)
-        if "/collections" in path and "/items" not in path and "statistics" not in path:
-            return _resp(200, _VECTOR_COLLECTIONS)
-        return _resp(200, {})
+    result = await mcp_full_fx.call_tool("collection_health_check", {})
 
-    mock_httpx_request.side_effect = _router
+    assert "public.st_hexagongrid" not in result.structured_content["vector"]
+
+
+async def test_collection_health_check_follows_stac_pagination(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
+):
+    """Both backends paginate /collections at ten by default.
+
+    Verified live on 2026-07-31: https://api.cheias.pt/collections returns 10 of
+    11 collections and hides `wind-v` behind a `next` link. Reading only the
+    first page reports a subset of the catalogue as if it were all of it.
+    """
+    page_one = {
+        "collections": [{"id": f"col-{i}"} for i in range(10)],
+        "links": [{"rel": "next", "href": "https://fake.example/collections?offset=10"}],
+    }
+    page_two = {"collections": [{"id": "wind-v"}], "links": [{"rel": "self"}]}
+    mock_httpx_send.side_effect = health_router(stac_pages=[page_one, page_two])
+
+    result = await mcp_full_fx.call_tool("collection_health_check", {})
+
+    assert "wind-v" in result.structured_content["raster"]
+    assert len(result.structured_content["raster"]) == 11
+
+
+async def test_collection_health_check_pagination_is_bounded(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
+):
+    """A backend whose `next` link never ends must not spin forever."""
+    endless = {
+        "collections": [{"id": "col"}],
+        "links": [{"rel": "next", "href": "https://fake.example/collections?offset=1"}],
+    }
+    mock_httpx_send.side_effect = health_router(stac_pages=[endless])
+
+    result = await mcp_full_fx.call_tool("collection_health_check", {})
+
+    listing_calls = [
+        c for c in mock_httpx_send.call_args_list
+        if c.args[0].url.path == "/collections"
+    ]
+    assert len(listing_calls) == 20  # _MAX_COLLECTION_PAGES
+    assert "col" in result.structured_content["raster"]
+
+
+async def test_collection_health_check_with_specific_ids(mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock):
+    """Dotted ids route to tipg, bare ids to STAC; no listing call is needed."""
+    mock_httpx_send.side_effect = health_router()
 
     result = await mcp_full_fx.call_tool(
         "collection_health_check",
-        {"collection_ids": ["public.flood_extent_emsr864"]},
+        {"collection_ids": ["public.flood_extent_emsr864", "precipitation-daily"]},
     )
 
     sc = result.structured_content
-    assert "error" not in sc or "collections" in sc
+    assert sc["vector"]["public.flood_extent_emsr864"]["reachable"] is True
+    assert sc["raster"]["precipitation-daily"]["reachable"] is True
+    assert sc["raster"]["precipitation-daily"]["sample_item"] == "precipitation-storm-total"
 
 
-async def test_collection_health_check_backend_unreachable(mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock):
-    """If a backend is unreachable, health check should still return, with error info."""
+async def test_collection_health_check_unreachable_collection_is_data_not_error(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
+):
+    """Reporting that a collection is down is what this tool is for."""
+    mock_httpx_send.side_effect = health_router(probe_status=503)
 
-    def _router(method, path, **kw):
-        # Both backends return errors
-        return _resp(503, text="service unavailable")
+    result = await mcp_full_fx.call_tool(
+        "collection_health_check",
+        {"collection_ids": ["public.flood_extent_emsr864", "precipitation-daily"]},
+    )
 
-    mock_httpx_request.side_effect = _router
+    sc = result.structured_content
+    assert sc["vector"]["public.flood_extent_emsr864"]["reachable"] is False
+    assert sc["raster"]["precipitation-daily"]["reachable"] is False
+    assert sorted(sc["unreachable"]) == ["precipitation-daily", "public.flood_extent_emsr864"]
+    assert sc["partial_failures"] == 2
+
+
+async def test_collection_health_check_one_backend_down(mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock):
+    """One listing failing still yields a report, with the failure recorded."""
+    mock_httpx_send.side_effect = health_router(stac_list_status=503)
 
     result = await mcp_full_fx.call_tool("collection_health_check", {})
 
     sc = result.structured_content
-    # Should not raise; should report the failure gracefully
-    assert sc is not None
+    assert sc["raster"] == {}
+    assert "public.flood_extent_emsr864" in sc["vector"]
+    assert "stac" in sc["enumeration_errors"]
+    assert "503" in sc["enumeration_errors"]["stac"]
 
 
-async def test_collection_health_check_vector_and_stac_called(mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock):
-    """Both vector and STAC endpoints should be called when collection_ids is None."""
-    paths_called = []
+async def test_collection_health_check_both_backends_down_raises(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
+):
+    """With nothing enumerable there is no report to give, so it raises."""
+    mock_httpx_send.side_effect = health_router(stac_list_status=503, vector_list_status=503)
 
-    def _router(method, path, **kw):
-        paths_called.append(path)
-        if "flood_extent" in path:
-            return _resp(200, _COLLECTION_META)
-        if "/info" in path:
-            return _resp(200, _RASTER_INFO)
-        if "collections" in path:
-            return _resp(200, _VECTOR_COLLECTIONS)
-        return _resp(200, _STAC_COLLECTIONS)
+    with pytest.raises(ToolError, match="neither backend could be enumerated"):
+        await mcp_full_fx.call_tool("collection_health_check", {})
 
-    mock_httpx_request.side_effect = _router
 
-    await mcp_full_fx.call_tool("collection_health_check", {})
+async def test_collection_health_check_connect_error_is_reported(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
+):
+    """A transport failure on a probe is reported per collection, not raised."""
 
-    # At least some HTTP calls should have been made
-    assert len(paths_called) > 0
+    def _router(request: httpx.Request, **kw):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    mock_httpx_send.side_effect = _router
+
+    result = await mcp_full_fx.call_tool(
+        "collection_health_check", {"collection_ids": ["precipitation-daily"]}
+    )
+
+    entry = result.structured_content["raster"]["precipitation-daily"]
+    assert entry["reachable"] is False
+    assert "unreachable" in entry["error"]
 
 
 # ---------------------------------------------------------------------------
-# Additional targeted tests for coverage of missed branches
+# Partial failure must be structurally impossible to skim past
 # ---------------------------------------------------------------------------
 
 
-async def test_flood_rainfall_analysis_vector_error(mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock):
-    """If the vector features call returns an error, it should be surfaced immediately."""
-    mock_httpx_request.return_value = _resp(503, text="tipg unavailable")
+async def test_flood_rainfall_partial_failure_is_stated_before_the_data(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
+):
+    """A count at the end of a long payload is a count that gets skimmed past.
+
+    With 1 of 2 polygons failing, a model reading only the features would
+    summarise "mean rainfall over the flooded area was X" — true of the one
+    polygon that worked, presented as true of both.
+    """
+    mock_httpx_send.side_effect = flood_router(stats_statuses=[500, 200])
 
     result = await mcp_full_fx.call_tool(
-        "flood_rainfall_analysis",
-        {
-            "flood_collection_id": "public.flood_extent_emsr864",
-            "precipitation_collection_id": "precipitation-daily",
-            "precipitation_item_id": "precipitation-storm-total",
-        },
+        "flood_rainfall_analysis", {"flood_collection_id": "public.flood_extent_emsr864"}
     )
 
     sc = result.structured_content
-    assert "error" in sc
-    assert sc["status"] == 503
+    keys = list(sc)
+    assert keys.index("partial_failures") < keys.index("features")
+    assert keys.index("note") < keys.index("features")
+    assert sc["features_analysed"] == 1
+    assert sc["features_attempted"] == 2
+    assert sc["note"].startswith("INCOMPLETE:")
+    assert "rainfall_error" in sc["note"]
 
 
-async def test_flood_rainfall_analysis_feature_no_geometry(mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock):
-    """A feature with geometry=None gets rainfall_error instead of crashing."""
-    feature_no_geom = {"type": "Feature", "id": "feat-null-geom", "geometry": None, "properties": {"area_ha": 10}}
-
-    def _router(method, path, **kw):
-        if "/items" in path and "statistics" not in path:
-            return _resp(200, {"type": "FeatureCollection", "features": [feature_no_geom], "numberMatched": 1})
-        return _resp(200, _STATS_FEATURE)
-
-    mock_httpx_request.side_effect = _router
+async def test_flood_rainfall_complete_result_has_no_incomplete_note(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
+):
+    mock_httpx_send.side_effect = flood_router()
 
     result = await mcp_full_fx.call_tool(
-        "flood_rainfall_analysis",
-        {
-            "flood_collection_id": "public.flood_extent_emsr864",
-            "precipitation_collection_id": "precipitation-daily",
-            "precipitation_item_id": "precipitation-storm-total",
-        },
+        "flood_rainfall_analysis", {"flood_collection_id": "public.flood_extent_emsr864"}
     )
 
     sc = result.structured_content
-    assert sc["type"] == "FeatureCollection"
-    features = sc["features"]
-    assert len(features) == 1
-    assert "rainfall_error" in features[0]["properties"]
+    assert sc["partial_failures"] == 0
+    assert "note" not in sc
+    assert sc["features_analysed"] == sc["features_attempted"] == 2
 
 
-async def test_flood_rainfall_analysis_unsupported_geometry_type(mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock):
-    """A feature with GeometryCollection geometry gets rainfall_error rather than crashing."""
-    feature_geomcoll = {
-        "type": "Feature",
-        "id": "feat-geomcoll",
-        "geometry": {
-            "type": "GeometryCollection",
-            "geometries": [{"type": "Point", "coordinates": [-8.0, 39.0]}],
-        },
-        "properties": {"area_ha": 5},
-    }
-
-    def _router(method, path, **kw):
-        if "/items" in path and "statistics" not in path:
-            return _resp(200, {"type": "FeatureCollection", "features": [feature_geomcoll], "numberMatched": 1})
-        return _resp(200, _STATS_FEATURE)
-
-    mock_httpx_request.side_effect = _router
+async def test_flood_rainfall_flags_a_truncated_polygon_set(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
+):
+    """limit=5 against 5,496 matching polygons is a sample, and must say so."""
+    body = {**_FEATURES_BODY, "numberMatched": 5496}
+    mock_httpx_send.side_effect = flood_router(features=body)
 
     result = await mcp_full_fx.call_tool(
-        "flood_rainfall_analysis",
-        {
-            "flood_collection_id": "public.flood_extent_emsr864",
-            "precipitation_collection_id": "precipitation-daily",
-            "precipitation_item_id": "precipitation-storm-total",
-        },
+        "flood_rainfall_analysis", {"flood_collection_id": "public.flood_extent_emsr864"}
     )
 
     sc = result.structured_content
-    assert sc["type"] == "FeatureCollection"
-    features = sc["features"]
-    assert len(features) == 1
-    assert "rainfall_error" in features[0]["properties"]
+    assert sc["truncated"] is True
+    assert "5496" in sc["truncation_note"]
+    assert list(sc).index("truncation_note") < list(sc).index("features")
 
 
-async def test_flood_rainfall_analysis_feature_geometry_is_feature(
-    mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock
+async def test_multi_layer_partial_failure_is_stated_before_the_layers(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
 ):
-    """A feature whose geometry field is itself a Feature object is passed as the stats body."""
-    # Unusual but handled: geometry.type == "Feature"
-    inner_feature = {
-        "type": "Feature",
-        "geometry": _FLOOD_POLYGON,
-        "properties": {},
-    }
-    feature_with_feature_geom = {
-        "type": "Feature",
-        "id": "feat-featuregeom",
-        "geometry": inner_feature,
-        "properties": {"area_ha": 42.0},
-    }
-
-    def _router(method, path, **kw):
-        if "/items" in path and "statistics" not in path:
-            return _resp(200, {"type": "FeatureCollection", "features": [feature_with_feature_geom], "numberMatched": 1})
-        elif "statistics" in path:
-            return _resp(200, _STATS_FEATURE)
-        return _resp(200, {})
-
-    mock_httpx_request.side_effect = _router
+    mock_httpx_send.side_effect = stats_router([500, 200])
 
     result = await mcp_full_fx.call_tool(
-        "flood_rainfall_analysis",
-        {
-            "flood_collection_id": "public.flood_extent_emsr864",
-            "precipitation_collection_id": "precipitation-daily",
-            "precipitation_item_id": "precipitation-storm-total",
-        },
+        "multi_layer_summary", {"geojson": _AOI_POLYGON, "raster_layers": _RASTER_LAYERS}
     )
 
     sc = result.structured_content
-    assert sc["type"] == "FeatureCollection"
-    features = sc["features"]
-    assert len(features) == 1
-    # Should have rainfall_stats (not an error), since the Feature branch was used as body
-    props = features[0]["properties"]
-    assert "rainfall_stats" in props or "rainfall_error" not in props
+    keys = list(sc)
+    assert keys.index("partial_failures") < keys.index("layers")
+    assert keys.index("note") < keys.index("layers")
+    assert sc["note"].startswith("INCOMPLETE:")
 
 
-async def test_multi_layer_summary_feature_with_non_polygon_geometry(
-    mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock
+async def test_health_check_unreachable_is_stated_before_the_sections(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
 ):
-    """Feature wrapping a Point geometry returns 400 without HTTP calls."""
-    feature_with_point = {
-        "type": "Feature",
-        "geometry": {"type": "Point", "coordinates": [-8.0, 39.0]},
-        "properties": {},
-    }
+    mock_httpx_send.side_effect = health_router(probe_status=503)
 
     result = await mcp_full_fx.call_tool(
-        "multi_layer_summary",
-        {"geojson": feature_with_point, "raster_layers": _RASTER_LAYERS},
+        "collection_health_check",
+        {"collection_ids": ["public.flood_extent_emsr864", "precipitation-daily"]},
     )
 
     sc = result.structured_content
-    assert sc["status"] == 400
-    assert "error" in sc
-    assert not mock_httpx_request.called
+    keys = list(sc)
+    assert keys.index("partial_failures") < keys.index("raster")
+    assert keys.index("note") < keys.index("vector")
 
 
-async def test_collection_health_check_with_stac_and_vector_ids_none(
-    mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock
+# ---------------------------------------------------------------------------
+# item_count must not be fabricated
+# ---------------------------------------------------------------------------
+
+
+async def test_health_check_reports_null_item_count_when_backend_gives_none(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
 ):
-    """When collection_ids=None, vector /collections is hit via mock_httpx_request
-    and STAC is hit via httpx.AsyncClient.get — mock both."""
-    stac_get_mock = AsyncMock()
-    stac_resp = MagicMock()
-    stac_resp.status_code = 200
-    stac_resp.json.return_value = _STAC_COLLECTIONS
-    stac_get_mock.return_value = stac_resp
+    """This STAC returns numberMatched=null on /items; the probe asks for limit=1.
 
-    def _request_router(method, path, **kw):
-        if "flood_extent_emsr864" in path:
-            return _resp(200, _COLLECTION_META)
-        if "/collections" in path:
-            return _resp(200, _VECTOR_COLLECTIONS)
-        return _resp(200, {})
+    Falling back to numberReturned produced `item_count: 1` for every raster
+    collection — a clean integer, in a plausibly-named field, inside a
+    `reachable: true` payload. wind-u really has 308 items. A null is honest.
+    """
 
-    mock_httpx_request.side_effect = _request_router
-
-    with patch("httpx.AsyncClient.get", new=stac_get_mock):
-        result = await mcp_full_fx.call_tool("collection_health_check", {})
-
-    sc = result.structured_content
-    assert "raster" in sc
-    assert "vector" in sc
-    # Vector collection should be reported
-    assert "public.flood_extent_emsr864" in sc["vector"]
-    # STAC collections should be in raster report
-    for col_id in [c["id"] for c in _STAC_COLLECTIONS["collections"]]:
-        assert col_id in sc["raster"]
-
-
-async def test_collection_health_check_stac_error_handled(
-    mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock
-):
-    """If STAC /collections raises an exception, the error is captured gracefully."""
-    import httpx as _httpx
-
-    stac_get_mock = AsyncMock(side_effect=_httpx.ConnectError("connection refused"))
-
-    def _request_router(method, path, **kw):
-        if "/collections" in path:
-            return _resp(200, _VECTOR_COLLECTIONS)
-        if "flood_extent_emsr864" in path:
-            return _resp(200, _COLLECTION_META)
-        return _resp(200, {})
-
-    mock_httpx_request.side_effect = _request_router
-
-    with patch("httpx.AsyncClient.get", new=stac_get_mock):
-        result = await mcp_full_fx.call_tool("collection_health_check", {})
-
-    sc = result.structured_content
-    # Should still return; raster section may have error info
-    assert sc is not None
-    # Vector section should still have results
-    assert "vector" in sc
-
-
-async def test_collection_health_check_specific_ids_raster_and_vector(
-    mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock
-):
-    """When collection_ids contains both dotted (vector) and plain (raster) IDs,
-    they are routed to the correct probes. Covers the raster_ids.append branch."""
-    stac_get_mock = AsyncMock()
-    stac_items_resp = MagicMock()
-    stac_items_resp.status_code = 200
-    stac_items_resp.json.return_value = {"features": [{"id": "some-item"}], "numberMatched": 1}
-    stac_get_mock.return_value = stac_items_resp
-
-    def _request_router(method, path, **kw):
-        if "flood_extent_emsr864" in path:
-            return _resp(200, _COLLECTION_META)
-        return _resp(200, {})
-
-    mock_httpx_request.side_effect = _request_router
-
-    with patch("httpx.AsyncClient.get", new=stac_get_mock):
-        result = await mcp_full_fx.call_tool(
-            "collection_health_check",
-            {"collection_ids": ["public.flood_extent_emsr864", "precipitation-daily"]},
+    def _router(request: httpx.Request, **kw):
+        return make_response(
+            request, 200, {"features": [{"id": "some-item"}], "numberMatched": None, "numberReturned": 1}
         )
 
-    sc = result.structured_content
-    assert "vector" in sc
-    assert "raster" in sc
-    assert "public.flood_extent_emsr864" in sc["vector"]
-    assert "precipitation-daily" in sc["raster"]
+    mock_httpx_send.side_effect = _router
+
+    result = await mcp_full_fx.call_tool(
+        "collection_health_check", {"collection_ids": ["wind-u"]}
+    )
+
+    entry = result.structured_content["raster"]["wind-u"]
+    assert entry["reachable"] is True
+    assert entry["item_count"] is None
+    assert entry["has_items"] is True
+    assert entry["sample_item"] == "some-item"
 
 
-async def test_collection_health_check_probe_vector_error(
-    mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock
+async def test_health_check_reports_a_real_item_count_when_available(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
 ):
-    """When a vector collection probe returns an error, reachable=False is reported."""
-
-    def _request_router(method, path, **kw):
-        # Vector collections list OK, but metadata probe for specific ID fails
-        if "/collections" in path and "flood_extent" not in path:
-            return _resp(200, _VECTOR_COLLECTIONS)
-        if "flood_extent_emsr864" in path:
-            return _resp(404, text="collection not found")
-        return _resp(200, {})
-
-    mock_httpx_request.side_effect = _request_router
-
-    stac_get_mock = AsyncMock()
-    stac_resp = MagicMock()
-    stac_resp.status_code = 200
-    stac_resp.json.return_value = {"collections": []}
-    stac_get_mock.return_value = stac_resp
-
-    with patch("httpx.AsyncClient.get", new=stac_get_mock):
-        result = await mcp_full_fx.call_tool("collection_health_check", {})
-
-    sc = result.structured_content
-    assert "vector" in sc
-    if "public.flood_extent_emsr864" in sc["vector"]:
-        assert sc["vector"]["public.flood_extent_emsr864"]["reachable"] is False
-
-
-async def test_collection_health_check_probe_raster_error_status(
-    mcp_full_fx: FastMCP, mock_httpx_request: AsyncMock
-):
-    """When the STAC items probe returns a 4xx, reachable=False is reported."""
-    # Vector collections list returns one collection that isn't vector (no dot = raster)
-    # We force raster by using collection_ids without dots
-    stac_get_mock = AsyncMock()
-    stac_items_resp = MagicMock()
-    stac_items_resp.status_code = 404
-    stac_items_resp.text = "items not found"
-    stac_get_mock.return_value = stac_items_resp
-
-    def _request_router(method, path, **kw):
-        return _resp(200, {})
-
-    mock_httpx_request.side_effect = _request_router
-
-    with patch("httpx.AsyncClient.get", new=stac_get_mock):
-        result = await mcp_full_fx.call_tool(
-            "collection_health_check",
-            {"collection_ids": ["precipitation-daily"]},
+    def _router(request: httpx.Request, **kw):
+        return make_response(
+            request, 200, {"features": [{"id": "i"}], "numberMatched": 308, "numberReturned": 1}
         )
 
+    mock_httpx_send.side_effect = _router
+
+    result = await mcp_full_fx.call_tool(
+        "collection_health_check", {"collection_ids": ["wind-u"]}
+    )
+
+    assert result.structured_content["raster"]["wind-u"]["item_count"] == 308
+
+
+async def test_health_check_deduplicates_collection_ids(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
+):
+    mock_httpx_send.side_effect = health_router()
+
+    await mcp_full_fx.call_tool(
+        "collection_health_check",
+        {"collection_ids": ["precipitation-daily", "precipitation-daily"]},
+    )
+
+    probes = [
+        c for c in mock_httpx_send.call_args_list
+        if c.args[0].url.path == "/collections/precipitation-daily/items"
+    ]
+    assert len(probes) == 1
+
+
+# ---------------------------------------------------------------------------
+# Label collisions silently dropped layers
+# ---------------------------------------------------------------------------
+
+
+async def test_multi_layer_summary_rejects_duplicate_labels(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
+):
+    """Results are keyed by label, so a collision used to overwrite a layer.
+
+    Three layers labelled "rain" returned one entry with partial_failures=0 —
+    fewer layers than asked for, and nothing in the payload saying so.
+    """
+    layers = [
+        {"collection_id": "precipitation-daily", "item_id": "storm-total", "label": "rain"},
+        {"collection_id": "soil-moisture-daily", "item_id": "sm", "label": "rain"},
+    ]
+
+    with pytest.raises(ToolError, match="more than one layer labelled 'rain'"):
+        await mcp_full_fx.call_tool(
+            "multi_layer_summary", {"geojson": _AOI_POLYGON, "raster_layers": layers}
+        )
+
+    assert not mock_httpx_send.called
+
+
+async def test_multi_layer_summary_rejects_collision_from_default_labels(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
+):
+    """The realistic case: two assets of one item, no labels, no user error.
+
+    The default label is collection_id/item_id, so both layers collide.
+    """
+    layers = [
+        {"collection_id": "precipitation-daily", "item_id": "storm-total", "asset": "data"},
+        {"collection_id": "precipitation-daily", "item_id": "storm-total", "asset": "quality"},
+    ]
+
+    with pytest.raises(ToolError, match="precipitation-daily/storm-total"):
+        await mcp_full_fx.call_tool(
+            "multi_layer_summary", {"geojson": _AOI_POLYGON, "raster_layers": layers}
+        )
+
+    assert not mock_httpx_send.called
+
+
+async def test_multi_layer_summary_accepts_distinct_labels_for_one_item(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
+):
+    """Two assets of the same item are fine once they are told apart."""
+    mock_httpx_send.side_effect = stats_router()
+    layers = [
+        {"collection_id": "precipitation-daily", "item_id": "storm-total", "asset": "data", "label": "total"},
+        {"collection_id": "precipitation-daily", "item_id": "storm-total", "asset": "data", "label": "quality"},
+    ]
+
+    result = await mcp_full_fx.call_tool(
+        "multi_layer_summary", {"geojson": _AOI_POLYGON, "raster_layers": layers}
+    )
+
+    assert set(result.structured_content["layers"]) == {"total", "quality"}
+
+
+async def test_counts_do_not_read_as_complete_when_truncated(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
+):
+    """The integers must not contradict the prose beside them.
+
+    `features_analysed: 2` next to `features_attempted: 2` reads as "2 of 2,
+    complete" — the pre-fix answer — when 5,496 polygons matched and only the
+    note carried that number. `features_matched` puts the real total back among
+    the integers, so a reader who skims the string still cannot conclude the
+    result is complete.
+    """
+    mock_httpx_send.side_effect = flood_router(features={**_FEATURES_BODY, "numberMatched": 5496})
+
+    result = await mcp_full_fx.call_tool(
+        "flood_rainfall_analysis", {"flood_collection_id": "public.flood_extent_emsr864"}
+    )
+
     sc = result.structured_content
-    assert "raster" in sc
-    assert "precipitation-daily" in sc["raster"]
-    assert sc["raster"]["precipitation-daily"]["reachable"] is False
+    assert sc["features_analysed"] == 2
+    assert sc["features_attempted"] == 2
+    assert sc["features_matched"] == 5496
+    assert sc["truncated"] is True
+    # Reading only the integers, analysed != matched, so the result is visibly partial.
+    assert sc["features_analysed"] < sc["features_matched"]
+
+
+async def test_no_features_matched_key_when_the_backend_omits_the_total(
+    mcp_full_fx: FastMCP, mock_httpx_send: AsyncMock
+):
+    """Absent is honest; a fabricated total would be the item_count bug again."""
+    body = {k: v for k, v in _FEATURES_BODY.items() if k != "numberMatched"}
+    mock_httpx_send.side_effect = flood_router(features=body)
+
+    result = await mcp_full_fx.call_tool(
+        "flood_rainfall_analysis", {"flood_collection_id": "public.flood_extent_emsr864"}
+    )
+
+    sc = result.structured_content
+    assert "features_matched" not in sc
+    assert sc["truncated"] is False if "truncated" in sc else True

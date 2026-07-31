@@ -6,6 +6,15 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Read-only by default; no job here needs to write to the repo.
+permissions:
+  contents: read
+
+# A new push to the same branch makes the in-flight run obsolete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 defaults:
   run:
     working-directory: servers/eo-mcp
@@ -20,62 +29,136 @@ jobs:
         python-version: ["3.11", "3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
 
       - name: Create venv on Python ${{ matrix.python-version }}
         run: uv venv --python ${{ matrix.python-version }}
 
-      - name: Install
+      # Resolves fresh from pyproject.toml, deliberately ignoring uv.lock: this
+      # is the path a contributor gets, and it catches a dependency shipping a
+      # breaking change inside our declared ranges. The locked path is covered
+      # by the `locked` job below.
+      - name: Install (fresh resolve)
         run: uv pip install -e '.[dev]'
 
+      # Every step below invokes .venv/bin/... directly instead of `uv run`.
+      # `uv run` re-syncs the environment from uv.lock before executing, which
+      # would silently replace the freshly resolved versions with the locked
+      # ones and make this job a duplicate of `locked`. Verified: with 3.2.4
+      # installed here, `uv run` uninstalls it and reinstalls the locked 3.4.5.
       - name: Lint
-        run: uv run ruff check src/ tests/
+        run: .venv/bin/ruff check src/ tests/
 
-      - name: Unit tests
+      # Coverage runs on every matrix entry rather than once: a branch reachable
+      # only on 3.11 (or only on 3.13) is exactly the kind of gap a single-version
+      # coverage run misses. The floor lives in [tool.coverage.report].
+      - name: Unit tests with coverage
         # Integration tests hit a live external backend, so they are excluded
         # from CI — a backend outage must not turn the build red.
         env:
           EO_MCP_SKIP_INTEGRATION: "1"
-        run: uv run pytest -m "not slow" -q
+        run: |
+          .venv/bin/python -m coverage run -m pytest -m "not slow" -q
+          .venv/bin/python -m coverage report
+
+  locked:
+    name: locked install (uv.lock)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+
+      # Fails if uv.lock has drifted from pyproject.toml. Without this a
+      # dependency change can land with a stale lock, and `uv sync` then
+      # installs a set of versions nobody tested.
+      - name: uv.lock is consistent with pyproject.toml
+        run: uv lock --check
+
+      - name: Install from the lockfile
+        run: uv sync --frozen --extra dev
+
+      - name: Unit tests against locked versions
+        env:
+          EO_MCP_SKIP_INTEGRATION: "1"
+        run: uv run --frozen pytest -m "not slow" -q
 
   smoke:
     name: clean-install smoke test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v9.0.0
 
       - name: Create venv
         run: uv venv --python 3.13
 
+      # Non-editable on purpose: this job exists to prove the packaged artifact
+      # works, not the working tree. Nothing below may use `uv run` — it would
+      # re-sync the project and reinstall eo-mcp as an *editable* install
+      # pointing at src/, so the job would silently stop testing the package.
       - name: Install from a clean tree (non-editable)
         run: uv pip install .
 
-      - name: Server builds and registers exactly the 11 documented tools
+      # A packaging regression that drops py.typed is invisible at runtime and
+      # surfaces only as downstream type checkers silently ignoring the package,
+      # so assert on the built artifact rather than trusting the build backend.
+      - name: Wheel ships py.typed and the package modules
         run: |
-          uv run python - <<'PY'
-          import asyncio
-          from eo_mcp.server import build_server
-
-          EXPECTED = {
-              "get_raster_info", "get_tile_url", "get_zonal_statistics",
-              "list_vector_collections", "get_vector_features", "get_vector_feature",
-              "get_vector_tile_url", "get_collection_queryables",
-              "flood_rainfall_analysis", "multi_layer_summary", "collection_health_check",
-          }
-
-          tools = {t.name for t in asyncio.run(build_server().list_tools())}
-          assert not (EXPECTED - tools), f"missing: {sorted(EXPECTED - tools)}"
-          assert not (tools - EXPECTED), f"unexpected: {sorted(tools - EXPECTED)}"
-          print(f"OK - {len(tools)} tools registered")
+          uv build --wheel --out-dir dist/
+          .venv/bin/python - <<'PY'
+          import pathlib, zipfile
+          wheel = sorted(pathlib.Path("dist").glob("*.whl"))[-1]
+          names = zipfile.ZipFile(wheel).namelist()
+          print(f"{wheel.name} contents:")
+          for n in sorted(names):
+              print(f"  {n}")
+          required = ["eo_mcp/py.typed", "eo_mcp/server.py", "eo_mcp/tools/raster.py"]
+          missing = [r for r in required if r not in names]
+          assert not missing, f"wheel is missing: {missing}"
+          print("\nOK - wheel ships py.typed and package modules")
           PY
 
-      - name: Console script is installed
-        run: uv run eo-mcp --help || true
+      # The real contract: the installed console script must speak MCP over
+      # stdio and serve exactly the documented tool set. Starting the process
+      # proves nothing — a server that starts and hangs looks identical.
+      # --expect-version guards a regression that is invisible at runtime: if
+      # build_server() stops passing an explicit version=, FastMCP substitutes
+      # its own, and every MCP client is told eo-mcp is version "3.x" — a number
+      # that then changes with an unrelated dependency bump.
+      - name: Console script speaks MCP over stdio and serves 11 tools
+        run: |
+          version=$(.venv/bin/python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          .venv/bin/python "$GITHUB_WORKSPACE/.github/scripts/mcp_stdio_smoke.py" \
+            --expect-version "$version" .venv/bin/eo-mcp
+
+  docker:
+    name: docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build image
+        run: docker build -t eo-mcp:ci .
+
+      - name: Container speaks MCP over stdio and serves 11 tools
+        run: |
+          version=$(python3 -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          python3 "$GITHUB_WORKSPACE/.github/scripts/mcp_stdio_smoke.py" \
+            --expect-version "$version" docker run --rm -i eo-mcp:ci
+
+      - name: Image runs as a non-root user
+        run: |
+          uid=$(docker run --rm --entrypoint id eo-mcp:ci -u)
+          echo "container uid: $uid"
+          test "$uid" != "0"

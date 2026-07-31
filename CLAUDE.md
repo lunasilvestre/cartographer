@@ -2,91 +2,197 @@
 
 Spatial intelligence harness for cloud-native Earth Observation.
 
-## What's here
+**This file is operating instructions for an agent working on this repository.**
+It is not user documentation. When a fact belongs to a reader, it lives in the
+document named below and this file links to it rather than copying it — a
+duplicated fact is a fact that will go stale.
 
-- `servers/eo-mcp/` — MCP server for TiTiler raster analysis + tipg vector queries
-- `prompts/` — Curated workflow recipes tagged by server + complexity
-- `.github/workflows/` — CI (lint, unit tests on 3.11–3.13, clean-install smoke test)
+| You need | Read |
+|---|---|
+| What the project is, install, config | `README.md` |
+| Tool signatures and the error contract | `servers/eo-mcp/README.md` |
+| Why it is built this way | `ARCHITECTURE.md` |
+| A real analysis with real output | `docs/WORKED-EXAMPLE.md` |
+| The backend contract, self-hosting | `docs/SELF-HOSTING.md` |
+| What CI enforces | `CONTRIBUTING.md` |
+| Where the live API diverges from its docs | `servers/eo-mcp/docs/*-api-notes.md` |
 
-Note: `skills/` and a top-level `docs/` are planned but do not exist yet. Do not
-reference them as if they do. API notes live in `servers/eo-mcp/docs/`.
+## Layout
 
-## MCP Servers
+- `servers/eo-mcp/` — the MCP server (TiTiler raster + tipg vector)
+- `prompts/` — workflow recipes tagged by server and complexity
+- `docs/` — reader documentation
+- `.github/workflows/` — CI
 
-### eo-mcp (this repo)
+There is no `skills/` directory and no skills. Do not reference one as if there
+were; create it only when writing the first skill.
 
-Eleven tools, all thin proxies — the server performs no geospatial computation.
+## Hard constraints
+
+**Exactly eleven tools, with these names.** CI asserts the set via
+`EXPECTED_TOOLS` in `.github/scripts/mcp_stdio_smoke.py`, which drives a real MCP
+handshake, so a rename or addition fails the build rather than drifting past the
+documents that quote it.
 
 - **Raster (3):** `get_raster_info`, `get_tile_url`, `get_zonal_statistics`
 - **Vector (5):** `list_vector_collections`, `get_vector_features`, `get_vector_feature`, `get_vector_tile_url`, `get_collection_queryables`
 - **Workflows (3):** `flood_rainfall_analysis`, `multi_layer_summary`, `collection_health_check`
-- **Backends:** TiTiler at `$EO_MCP_RASTER_URL`, tipg at `$EO_MCP_VECTOR_URL`, STAC at `$EO_MCP_STAC_URL` (defaults under `https://api.cheias.pt`)
-- **Run:** `cd servers/eo-mcp && uv run python -m eo_mcp.server`
 
-If you add or remove a tool, update: this file, `README.md`, `servers/eo-mcp/README.md`,
-and the `EXPECTED` set in `.github/workflows/ci.yml`. The smoke test asserts the exact
-tool set, so a mismatch fails CI rather than drifting silently.
+Changing a tool's *parameters* is ordinary work. Changing the *set* needs
+agreement first, and then updates to all of: `.github/scripts/mcp_stdio_smoke.py`
+(the `EXPECTED_TOOLS` set), `README.md`, `servers/eo-mcp/README.md`, and this
+file. `ci.yml` contains no tool names — it only invokes the script.
 
-### Sidekick servers (external, install separately)
+**The server performs no geospatial computation.** It builds URLs, validates
+parameters, forwards requests, shapes responses. If a change needs `numpy`,
+`rasterio` or `shapely`, it is in the wrong repository.
 
-- **stac-mcp** (Wayfinder): STAC discovery. `pip install stac-mcp`
-- **gdal-mcp** (JordanGunn): Local raster/vector transform. `pip install gdal-mcp`
-- **duckdb-mcp**: Analytical queries over geoparquet/CSV.
+**No tool accepts a URL, hostname or file path.** Every tool resolves against the
+configured backend from a `collection_id` / `item_id`. Accepting a caller-supplied
+URL would make the server an SSRF primitive. See `SECURITY.md`.
 
-## Taxonomy
+**Never state a backend fact you have not probed.** The documentation in this
+repo was wrong once because collection names were written from memory. Verify:
 
-- MCP server = runtime process, responds to tool calls
-- Skill = static markdown, teaches Claude how to use tools
-- Prompt = workflow recipe, chains tools to answer domain questions
+```bash
+curl -s "https://api.cheias.pt/collections?limit=100" | jq -r '.collections[].id'
+curl -s "https://api.cheias.pt/vector/collections?f=json" | jq -r '.collections[].id'
+```
 
-A skill NEVER duplicates a tool. A tool NEVER contains rendering logic.
-
-## Testing
+## Running and testing
 
 ```bash
 cd servers/eo-mcp
-uv run pytest -m "not slow"   # 60 unit tests, no network
-uv run pytest                 # + 11 live integration tests against api.cheias.pt
+uv sync --extra dev                 # creates .venv from uv.lock
+uv run python -m eo_mcp.server
+
 uv run ruff check src/ tests/
-uv run coverage run -m pytest -m "not slow" && uv run coverage report -m
+EO_MCP_SKIP_INTEGRATION=1 uv run pytest -m "not slow" -q
+uv run pytest                       # + live integration tests
+
+EO_MCP_SKIP_INTEGRATION=1 uv run coverage run -m pytest -m "not slow"
+uv run coverage report              # floor set in [tool.coverage.report], branch on
 ```
 
-Integration tests are excluded from CI because they depend on an external host.
-Set `EO_MCP_SKIP_INTEGRATION=1` to skip them locally.
+**Never mix `uv pip install` with `uv run`.** `uv run` re-syncs from `uv.lock`
+and silently discards what `uv pip install` did. Use `uv sync` + `uv run`, or
+`uv pip install` + `.venv/bin/…` — never one of each.
+
+Integration tests hit a live personal backend. They must stay skippable via
+`EO_MCP_SKIP_INTEGRATION=1` and must **never** gate CI — a backend outage must
+not turn the build red.
+
+## Error contract
+
+Every failure raises `fastmcp.exceptions.ToolError`. **No tool returns an
+`{"error": ...}` dictionary**, because a returned dict is a *successful* result
+as far as MCP is concerned, and a model will narrate its contents as fact.
+
+The three workflow tools are the deliberate exception: they aggregate many calls,
+report per-item failures in band with a `partial_failures` count, and raise only
+when no useful result is possible.
+
+Full contract, retry policy and real error messages: `servers/eo-mcp/README.md`.
 
 ## Backends
 
-Production eoAPI deployment (`stac-fastapi-pgstac` + `titiler-pgstac` + `tipg` + nginx),
-built for the February 2026 Portuguese floods study. Deployment repo: `cheias-pt-eoapi`.
+Production eoAPI deployment (`stac-fastapi-pgstac` + `titiler-pgstac` + `tipg` +
+nginx), built for the February 2026 Portuguese floods study. Deployment repo:
+`cheias-pt-eoapi`.
 
 - STAC: <https://api.cheias.pt>
-- Raster (TiTiler): <https://api.cheias.pt/raster>
-- Vector (tipg): <https://api.cheias.pt/vector>
+- Raster: <https://api.cheias.pt/raster>
+- Vector: <https://api.cheias.pt/vector>
 
-### Collections — verified live 2026-07-31
+The collection inventory (11 STAC, 13 tipg of which 7 are domain data) is in
+`README.md`. The `public.` prefix is required on tipg collection ids; the tools
+normalise a bare name.
 
-**STAC (11 total).** Raster assets under key `data`:
-`precipitation-daily`, `soil-moisture-daily`, `precondition`, `ivt`, `mslp`,
-`satellite-ir`, `sst-anomaly`, `wind-u`, `wind-v`.
-Vector-backed (no raster assets; they link out to tipg):
-`flood-extent-emsr861`, `flood-extent-emsr864`.
+`list_vector_collections` now filters PostGIS utility tables itself and reports
+them under `excluded_internal` — do not tell anyone to filter them by hand, and
+do not add a hardcoded exclusion list; the filter matches the PostGIS naming
+convention so it generalises to other backends.
 
-Raster collections carry `cheias:rescale` and `cheias:colormap` properties — prefer
-those over guessing values for `get_tile_url`.
+## Failure modes that matter here
 
-**Vector / tipg (13 total; 7 domain).** The `public.` schema prefix is **required**:
-`public.flood_extent_emsr861`, `public.flood_extent_emsr864`, `public.frontal_boundaries`,
-`public.storm_tracks`, `public.discharge_stations`, `public.rivers_portugal`,
-`public.consequence_events`.
-The remaining six (`postgis_srs*`, `st_subdivide`, `st_hexagongrid`, `st_squaregrid`)
-are PostGIS utility tables — filter them out when listing.
+This is a proxy, so the dangerous failures are silent rather than loud. All three
+below return HTTP 200. Guarding against *confidently wrong* is the design problem.
 
-Flood-extent columns: `ogc_fid`, `datetime`, `activation`, `aoi`, `area_ha`,
-`event_type`, `storm`.
+**The `flood-extent-*` STAC items are not flood footprints.** Their geometry is a
+placeholder rectangle covering mainland Portugal. Using one as an AOI computes
+over ~193x too much area and returns a precise, plausible, wrong number. Flood
+geometry always comes from tipg. Worked through in `docs/WORKED-EXAMPLE.md`.
 
-## Known API quirks
+**STAC `/collections` pages at 10** and this catalogue has 11. An unpaginated
+read silently omits `wind-v`. Pass `?limit=100` in any curl you write.
+`collection_health_check` follows the pagination itself.
 
-`servers/eo-mcp/docs/tipg-api-notes.md` records six places where the live tipg API
-diverges from its documentation — the date column is `datetime` not `event_date`,
-queryables need `?f=schemajson`, CQL2 needs `TIMESTAMP(...)` wrappers, and
-`items/{id}` is unusable against PostGIS tables. Read it before extending vector tools.
+**`cheias:rescale` is collection-level but ranges are per-item.**
+`precipitation-daily` publishes `[0, 80]`; its `precipitation-storm-total` item
+runs 100–582. `get_tile_url` checks before applying: the collection value is used
+if it spans the item's range, otherwise the item's own 2nd–98th percentiles.
+`rescale_source` says which won. Not a plain default — a checked one.
+
+**A too-wide ramp is reported, not corrected.** If the collection value spans the
+data but the data uses under a third of it, the collection value still applies
+and `rescale_note` explains. This is deliberate: a shared scale is what makes
+sibling items comparable, and per-item rescaling would render a dry day and a wet
+day identically. Do not "fix" it. Conversely, when the tool *does* override, the
+tile is no longer on the same scale as its siblings — say so if a reader is
+building a time series.
+
+**`item_data_range: null` means the check could not run** — the item published no
+usable percentiles (`satellite-ir`), so the collection value was taken on trust.
+The only case where the applied rescale cannot be compared against the data.
+
+**`color_formula` breaks these rasters.** It operates on RGB bands; every raster
+here is single-band float32. TileJSON returns fine and the tile then 500s with
+`index 1 is out of bounds for axis 0 with size 1`. Never put it in an example.
+
+**There is no `total` in a statistics block, and `sum` is not one.** `sum` adds
+pixel values, so for a depth raster it is millimetres summed across pixels —
+`sum / count` is just `mean` again. Never report it as a rainfall total; that is
+a confident nonsense number a reader has no way to catch. A real catchment total
+needs pixel area × depth, which this server does not compute by design. Report
+the mean with the area beside it. Areas *are* additive; rainfall is not.
+
+**Requests above roughly 1 MB are rejected by the edge** — 413 or 403 depending
+on network path, HTML not JSON either way. `get_vector_features` strips tipg's
+WKB-hex `id` and `links` (~95% of a raw Feature), but the largest polygons still
+exceed the cap alone (`ogc_fid=111` is 1.8 MB stripped), so use
+**`simplify=0.0001`** for large polygons.
+
+**Never recommend a coarser `simplify` without checking.** Past about `0.0005`
+tipg stops coarsening and returns **null geometry** instead — HTTP 200,
+properties intact, shape gone. Measured on `flood_extent_emsr864`: `0.0005` nulls
+29%, `0.001` nulls **61%**, `0.01` nulls 96%; `0.0001` loses none. `0.001` is the
+obvious round number to reach for and it is the wrong one.
+`get_vector_features` reports `null_geometry_count` and `null_geometry_note`.
+`area_ha` is a stored column that survives a null geometry, so an area total
+looks correct while the shapes are missing — it cannot detect the loss or measure
+simplification error.
+
+More in `servers/eo-mcp/docs/tipg-api-notes.md`, which records six places the
+live tipg API diverges from its documentation — the date column is `datetime` not
+`event_date`, queryables need `?f=schemajson`, CQL2 needs `TIMESTAMP(...)`
+wrappers, and `items/{id}` is unusable against PostGIS tables.
+
+## Taxonomy
+
+- **MCP server** — runtime process, responds to tool calls (`servers/`)
+- **Prompt** — workflow recipe chaining tools (`prompts/`)
+- **Skill** — static markdown teaching a model to use tools (none exist)
+
+A skill never duplicates a tool. A tool never contains rendering logic.
+
+## Sidekick servers
+
+External projects that pair well; install separately. Details and verified
+versions in `docs/SIDEKICKS.md`.
+
+- **stac-mcp** (BnJam) — STAC discovery. `pip install stac-mcp`
+- **gdal-mcp** (Wayfinder-Foundry) — local raster/vector transform. `pip install gdal-mcp`
+
+For analytical SQL over geoparquet a DuckDB-backed server works well, but no
+specific package is endorsed here — `duckdb-mcp` is not a published PyPI package
+despite being an obvious name to guess.

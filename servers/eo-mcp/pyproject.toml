@@ -84,3 +84,35 @@ select = [
 # SIM108: the suggested ternaries exceed the line limit and read worse than the
 #   if/else they replace.
 "tests/*.py" = ["E501", "SIM108"]
+
+[tool.coverage.run]
+source = ["src/eo_mcp"]
+# Branch coverage as well as line coverage: this package is mostly parameter
+# validation and request shaping, where the interesting bugs live in the
+# untaken branch of a conditional rather than in an unexecuted line.
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+# Measured 99% (statement and branch). The remaining partials are guards that
+# are correct but unreachable from a test — notably the second check in the
+# double-checked lock in HttpBackend.client(), which an uncontended asyncio.Lock
+# never exercises. Those are worth keeping uncovered rather than deleting.
+#
+# The floor sits just below the measurement, sized by what it tolerates: at 649
+# statements, each point is ~6.5 statements, so 97 allows roughly a dozen
+# uncovered — a couple of defensive branches — where 95 would quietly absorb a
+# whole tool's error paths.
+#
+# 97 rather than something slacker because the headroom is demonstrated, not
+# assumed: the package grew 536 -> 649 statements in a day and coverage stayed
+# at 99% throughout. Growth here has not eroded coverage. Do not raise it above
+# 97 — that starts failing the build on correct-but-untestable guards, such as
+# the second check in the double-checked lock in HttpBackend.client(), which an
+# uncontended asyncio.Lock never exercises.
+fail_under = 97
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    'if __name__ == "__main__":',
+]

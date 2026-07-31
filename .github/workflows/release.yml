@@ -1,0 +1,106 @@
+name: Release
+
+# Publishes to PyPI only for an annotated version tag (v0.1.0, v1.2.3, ...).
+# Nothing is published on a normal push or PR.
+#
+# Uses PyPI Trusted Publishing (OIDC) — no API token is stored in this repo.
+# One-time setup before the first tag, at https://pypi.org/manage/account/publishing/:
+#   PyPI project name: eo-mcp
+#   Owner:             lunasilvestre
+#   Repository:        cartographer
+#   Workflow name:     release.yml
+#   Environment name:  pypi
+# Then create a GitHub Environment named `pypi` (Settings -> Environments) and,
+# if you want a human in the loop, add yourself as a required reviewer there.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: servers/eo-mcp
+
+jobs:
+  build:
+    name: build and verify artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+
+      - name: Create venv
+        run: uv venv --python 3.13
+
+      # A tag that disagrees with pyproject.toml would publish a version nobody
+      # asked for, and PyPI uploads cannot be replaced once made.
+      # As in ci.yml, steps invoke .venv/bin/... directly rather than `uv run`,
+      # which would re-sync the project and reinstall eo-mcp from source —
+      # meaning the checks below would verify the working tree instead of the
+      # artifact about to be published.
+      - name: Tag matches the packaged version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(.venv/bin/python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          echo "tag=$tag pyproject=$pkg"
+          test "$tag" = "$pkg" || { echo "::error::tag $GITHUB_REF_NAME does not match pyproject version $pkg"; exit 1; }
+
+      - name: Build sdist and wheel
+        run: uv build --out-dir dist/
+
+      - name: Artifacts are well formed
+        run: |
+          uv pip install twine
+          .venv/bin/twine check dist/*
+
+      # Never publish an artifact that has not been shown to serve the tool set.
+      # This installs the built wheel and drives the console script it provides,
+      # so the thing exercised here is exactly the thing uploaded to PyPI.
+      # The version assertion matters most here: this is the artifact that goes
+      # to PyPI, so the version it reports to clients must be the version it is
+      # published under, not whatever FastMCP happens to resolve to.
+      - name: Installed wheel speaks MCP over stdio and serves 11 tools
+        run: |
+          uv pip install dist/*.whl
+          version=$(.venv/bin/python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          .venv/bin/python "$GITHUB_WORKSPACE/.github/scripts/mcp_stdio_smoke.py" \
+            --expect-version "$version" .venv/bin/eo-mcp
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: servers/eo-mcp/dist/
+          if-no-files-found: error
+
+  publish:
+    name: publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: pypi
+      url: https://pypi.org/p/eo-mcp
+    permissions:
+      # Mints the short-lived OIDC token Trusted Publishing exchanges for an
+      # upload credential. This is the only write permission in the workflow,
+      # and no long-lived PyPI token exists to leak.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@v1.14.2
+        with:
+          packages-dir: dist/

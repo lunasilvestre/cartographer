@@ -1,0 +1,28 @@
+# The build context is the eo-mcp package directory. Everything the image needs
+# is listed explicitly in the Dockerfile's COPY lines; this file keeps the
+# ~109 MB local .venv (and friends) from being shipped to the daemon on every
+# build, and keeps stale bytecode out of the image.
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+.git/
+.gitignore
+
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+tests/
+docs/
+
+.env
+.env.local
