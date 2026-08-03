@@ -73,12 +73,18 @@ Restart your client, then ask:
 
 Prefer a local checkout? See [Development](#development).
 
-> **A note on the command above.** The `git+https://…#subdirectory=servers/eo-mcp`
-> form cannot resolve until this repository is public, so it has not been executed
-> against GitHub. What *has* been verified is everything else about it: the same
-> command against `git+file://` on a local clone builds and starts the server, as
-> does `uvx --from ./servers/eo-mcp eo-mcp`. The `#subdirectory=` fragment and the
-> `eo-mcp` entry point are therefore known good; only the host is untested.
+> **The command above has been run against GitHub**, from an empty `UV_CACHE_DIR`
+> so nothing was reused from a local build (2026-08-03). uv resolved the
+> repository, built `eo-mcp` from the `servers/eo-mcp` subdirectory, installed 69
+> packages, and the server completed an MCP `initialize` handshake over stdio and
+> returned **exactly the eleven documented tools**, reporting itself as
+> `eo-mcp 0.1.0`. That check is `.github/scripts/mcp_stdio_smoke.py`, the same
+> script CI runs — point it at any server command:
+>
+> ```bash
+> python .github/scripts/mcp_stdio_smoke.py --expect-version 0.1.0 \
+>   uvx --from "git+https://github.com/lunasilvestre/cartographer.git#subdirectory=servers/eo-mcp" eo-mcp
+> ```
 
 ### Check the backend without installing anything
 
