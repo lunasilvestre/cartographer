@@ -1,14 +1,16 @@
 # Cartographer
 
+[![CI](https://github.com/lunasilvestre/cartographer/actions/workflows/ci.yml/badge.svg)](https://github.com/lunasilvestre/cartographer/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+
+![Cartographer — an MCP server exposing eleven typed tools over a production eoAPI stack. A natural-language query, "how much rain fell over the flooded areas near Coimbra?", runs against a contour map with a selected tile extent.](docs/assets/cartographer-hero.png)
+
 **An MCP server that lets an LLM agent query a live Earth Observation catalogue in natural language — no geospatial code required.**
 
 `eo-mcp` exposes eleven tools over a production [eoAPI](https://eoapi.dev/) stack (STAC + TiTiler + tipg). Ask *"how much rain fell over the flooded areas near Coimbra?"* and the agent finds the Copernicus EMS flood polygons, runs server-side zonal statistics against the ERA5 precipitation raster, and answers — without transferring a single pixel to the client.
 
 The server does **zero** geospatial processing. It is a thin, typed proxy: all compute stays on the backend.
-
-[![CI](https://github.com/lunasilvestre/cartographer/actions/workflows/ci.yml/badge.svg)](https://github.com/lunasilvestre/cartographer/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 
 That example is not hypothetical. It is written up call by call, with real output, in
 **[the worked example](docs/WORKED-EXAMPLE.md)** — including the mistake that makes the
