@@ -19,10 +19,10 @@ classifiers = [
 dependencies = [
     # fastmcp 3.x only: the 2.x server API is incompatible (tool results moved
     # from list[Content] to ToolResult, and fastmcp.exceptions was restructured).
-    "fastmcp>=3.0,<4",
+    "fastmcp>=3.4.6,<4",
     "httpx>=0.27",
     "pydantic>=2.0",
-    "pydantic-settings>=2.0",
+    "pydantic-settings>=2.15.0",
 ]
 
 [project.urls]
@@ -38,8 +38,8 @@ dev = [
     # so an unpinned linter turns CI red on a ruff release rather than a code
     # change. The explicit [tool.ruff.lint] select below makes this deterministic
     # regardless, but the pin keeps autofix behaviour stable too.
-    "ruff>=0.16,<0.17",
-    "coverage>=7.0",
+    "ruff>=0.16.2,<0.17",
+    "coverage>=7.15.4",
 ]
 
 [project.scripts]
