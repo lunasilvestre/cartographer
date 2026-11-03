@@ -38,7 +38,7 @@ dev = [
     # so an unpinned linter turns CI red on a ruff release rather than a code
     # change. The explicit [tool.ruff.lint] select below makes this deterministic
     # regardless, but the pin keeps autofix behaviour stable too.
-    "ruff>=0.16,<0.17",
+    "ruff>=0.16,<0.18",
     "coverage>=7.0",
 ]
 
